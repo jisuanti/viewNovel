@@ -12,6 +12,9 @@ function safeGetLocal(k){try{return localStorage.getItem(k)}catch(e){return null
 function safeSetLocal(k,v){try{localStorage.setItem(k,v)}catch(e){}}
 function safeBind(id,e,f){const el=document.getElementById(id);if(el)el[e]=f}
 
+// 把默认的丑头像换成了你的专属链接
+const DEFAULT_AVATAR = 'https://img.remit.ee/i/NFKpxA6gUtZs';
+
 // ================= 初始化 =================
 function initApp() {
     const statusEl = document.getElementById('cloud-status');
@@ -40,7 +43,7 @@ function getDefaultStory() {
     let map = new Array(1600).fill('transparent');
     for (let y = 0; y < 40; y++) { for (let x = 0; x < 40; x++) { let idx = y * 40 + x; if (x < 20) map[idx] = '#2E8B57'; if (x >= 25) map[idx] = '#4682B4'; if (x >= 15 && x < 25 && y > 20) map[idx] = '#4682B4'; if (x >= 20 && x < 25 && y <= 20) map[idx] = '#2E8B57'; } }
     return {
-        id: 'story_1793443325138', title: 'Rainative', author: '寒流偏暖', intro: '这是一个关于末日、大雨和希望的故事...', status: 'private', cover: 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop', tags: [], chapters: [], 
+        id: 'story_1793443325138', title: 'Rainative', author: '寒流偏暖', author_avatar: DEFAULT_AVATAR, intro: '这是一个关于末日、大雨和希望的故事...', status: 'private', cover: 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop', tags: [], chapters: [], 
         characters: [{ id: 'char_1', name: '我', desc: '主角，可男可女' }, { id: 'char_2', name: '露薇娅', desc: '你在天台遇到的白毛少女，她拥有深邃的蓝瞳孔，飘逸洁白的长发和柔软的白色连衣裙，看起来与这个世界格格不入，她会是谁呢......？' }, { id: 'char_3', name: '苏珊', desc: '你们因为一碗蘑菇汤相识成为朋友，在绝境中萌生的善意、向着太阳的希望，教会你打败其他人、脱离苦海的是......' }],
         plots: [{ id: 'plot_1', title: '大楼', desc: '末日后的安全屋', x: 25, y: 55 }], wiki: [], relationships: [], mapGrid: map, is_draft: true 
     };
@@ -91,8 +94,9 @@ function updateAuthUI() {
     if (currentUser) {
         document.getElementById('auth-btn').style.display = 'none';
         document.getElementById('user-profile-area').style.display = 'flex';
-        const savedAvatar = safeGetLocal('user_avatar') || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=100';
+        const savedAvatar = safeGetLocal('user_avatar') || DEFAULT_AVATAR;
         const savedName = safeGetLocal('user_name') || currentUser.email.split('@')[0];
+        
         document.getElementById('nav-avatar').src = savedAvatar;
         document.getElementById('nav-username').innerText = savedName;
         document.getElementById('profile-avatar').src = savedAvatar;
@@ -103,7 +107,7 @@ function updateAuthUI() {
 
 function openProfileModal() { document.getElementById('profile-overlay').classList.add('active'); }
 
-// [修复] 保存资料时，同步更新名下所有小说的作者名
+// [修复] 保存资料时，顺便更新你名下所有小说的作者名和头像
 function saveProfile() {
     const newName = document.getElementById('profile-name-input').value;
     const newAvatar = document.getElementById('profile-avatar-input').value;
@@ -116,6 +120,7 @@ function saveProfile() {
         stories.forEach(s => {
             if (s.user_id === currentUser.id) {
                 s.author = newName; 
+                s.author_avatar = newAvatar; // 把头像也塞进小说数据里
             }
         });
         saveStories(stories);
@@ -127,7 +132,7 @@ function saveProfile() {
     if (window.location.hash.startsWith('#profile/')) renderProfilePage();
 }
 
-// [修复] 未登录或查看他人主页时，通过作品反推作者名
+// [修复] 未登录查看主页时，从作品反推名字和头像
 async function renderProfilePage() {
     const parts = window.location.hash.split('/');
     let targetId = parts[1];
@@ -139,15 +144,17 @@ async function renderProfilePage() {
     document.getElementById('btn-edit-profile').style.display = isMe ? 'block' : 'none';
     
     let userName = `作者_${targetId.substring(0,5)}`; 
-    let userAvatar = 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=100'; 
+    let userAvatar = DEFAULT_AVATAR; 
 
     const authorStories = localStoriesCache.filter(s => s.user_id === targetId);
     
     if (isMe) {
         userName = safeGetLocal('user_name') || (currentUser.email ? currentUser.email.split('@')[0] : '我的主页');
-        userAvatar = safeGetLocal('user_avatar') || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=100';
+        userAvatar = safeGetLocal('user_avatar') || DEFAULT_AVATAR;
     } else if (authorStories.length > 0) {
+        // 未登录时，从他们的第一本书里把名字和头像薅出来
         userName = authorStories[0].author || '未命名作者';
+        userAvatar = authorStories[0].author_avatar || DEFAULT_AVATAR;
     }
     
     document.getElementById('prof-big-avatar').src = userAvatar;
@@ -195,7 +202,7 @@ async function pullFromCloud() {
         const { data, error } = await supabaseClient.from('stories').select('*');
         if (error) throw error;
         const cloudStories = data.map(s => ({
-            id: s.id, title: s.title, author: s.author, intro: s.intro, status: s.status, cover: s.cover,
+            id: s.id, title: s.title, author: s.author, author_avatar: s.author_avatar || DEFAULT_AVATAR, intro: s.intro, status: s.status, cover: s.cover,
             tags: s.tags || [], chapters: s.chapters || [], characters: s.characters || [], plots: s.plots || [], 
             wiki: s.wiki || [], relationships: s.relationships || [], mapGrid: s.map_grid || new Array(1600).fill('transparent'),
             is_draft: false, user_id: s.user_id
@@ -219,7 +226,7 @@ async function uploadToCloud(storyId) {
     showToast("上传中...");
     try {
         const { error } = await supabaseClient.from('stories').upsert({
-            id: story.id, title: story.title, author: story.author, intro: story.intro, status: story.status, cover: story.cover,
+            id: story.id, title: story.title, author: story.author, author_avatar: story.author_avatar, intro: story.intro, status: story.status, cover: story.cover,
             tags: story.tags, chapters: story.chapters, characters: story.characters, plots: story.plots, wiki: story.wiki, relationships: story.relationships, map_grid: story.mapGrid,
             user_id: currentUser.id, is_draft: false
         }, { onConflict: 'id' });
@@ -746,7 +753,7 @@ function openCreateStoryModal() {
     openModal("创建新小说", `<div class="form-group"><label>标题</label><input type="text" id="m-title" value=""></div>`, () => {
         const title = document.getElementById('m-title').value; if(!title) return showToast("请输入标题");
         const stories = getStories();
-        stories.push({ id: 'story_' + Date.now(), title, author: '', intro: '', status: 'private', cover: '', tags: [], chapters: [], characters: [], plots: [], wiki: [], relationships: [], mapGrid: new Array(1600).fill('transparent'), is_draft: true });
+        stories.push({ id: 'story_' + Date.now(), title, author: '', author_avatar: DEFAULT_AVATAR, intro: '', status: 'private', cover: '', tags: [], chapters: [], characters: [], plots: [], wiki: [], relationships: [], mapGrid: new Array(1600).fill('transparent'), is_draft: true });
         saveStories(stories); renderWorkspace(); 
     });
 }
