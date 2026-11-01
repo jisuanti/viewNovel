@@ -6,7 +6,7 @@ let supabaseClient = null;
 let currentUser = null;
 let localStoriesCache = []; 
 let globalProfilesCache = {}; 
-const DEFAULT_AVATAR = 'https://img.remit.ee/i/NFKpxA6gUtZs';
+const DEFAULT_AVATAR = 'https://ui-avatars.com/api/?name=User&background=333&color=fff&size=128';
 
 // ================= 工具与安全 =================
 function safeGetLocal(k){try{return localStorage.getItem(k)}catch(e){return null}}
@@ -40,29 +40,31 @@ function initApp() {
 function getDefaultStory() {
     let map = new Array(1600).fill('transparent');
     for (let y = 0; y < 40; y++) { for (let x = 0; x < 40; x++) { let idx = y * 40 + x; if (x < 20) map[idx] = '#2E8B57'; if (x >= 25) map[idx] = '#4682B4'; if (x >= 15 && x < 25 && y > 20) map[idx] = '#4682B4'; if (x >= 20 && x < 25 && y <= 20) map[idx] = '#2E8B57'; } }
-    return {
-        id: 'story_1793443325138', title: 'Rainative', author: '寒流偏暖', author_avatar: DEFAULT_AVATAR, intro: '这是一个关于末日、大雨和希望的故事...', status: 'private', cover: 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop', tags: [], chapters: [], 
-        characters: [{ id: 'char_1', name: '我', desc: '主角，可男可女' }, { id: 'char_2', name: '露薇娅', desc: '你在天台遇到的白毛少女...' }, { id: 'char_3', name: '苏珊', desc: '你们因为一碗蘑菇汤相识...' }],
-        plots: [{ id: 'plot_1', title: '大楼', desc: '末日后的安全屋', x: 25, y: 55 }], wiki: [], relationships: [], mapGrid: map, is_draft: true 
-    };
+    return { id: 'story_1793443325138', title: 'Rainative', author: '寒流偏暖', author_avatar: DEFAULT_AVATAR, intro: '...', status: 'private', cover: '...', tags: [], chapters: [], characters: [], plots: [], wiki: [], relationships: [], mapGrid: map, is_draft: true };
 }
 
 async function checkSession() {
     if(!supabaseClient) return;
     try {
         const { data: { session } } = await supabaseClient.auth.getSession();
-        if (session) { currentUser = session.user; updateAuthUI(); }
+        if (session) { currentUser = session.user; }
         
         const statusEl = document.getElementById('cloud-status');
         if(statusEl) { statusEl.innerText = '🟢 已连接云端'; statusEl.style.color = '#52c41a'; }
         
-        // 核心修复：自动拉取所有人的资料缓存
         try {
             const { data: profiles } = await supabaseClient.from('profiles').select('*');
             if (profiles) { profiles.forEach(p => { globalProfilesCache[p.id] = p; }); }
         } catch(e) {}
         
+        updateAuthUI();
         await pullFromCloud(); 
+
+        // 如果登录了，但从未设置过资料，强制弹窗
+        if (currentUser && (!globalProfilesCache[currentUser.id] || !globalProfilesCache[currentUser.id].username)) {
+            openProfileModal(true);
+        }
+
     } catch(e) { 
         const statusEl = document.getElementById('cloud-status');
         if(statusEl) statusEl.innerText = '🔴 连接失败'; 
@@ -80,9 +82,18 @@ async function handleAuth(type) {
         let res = type === 'login' ? await supabaseClient.auth.signInWithPassword({ email, password }) : await supabaseClient.auth.signUp({ email, password });
         if (res.error) throw res.error;
         showToast("操作成功"); document.getElementById('auth-overlay').classList.remove('active');
-        if (res.data.user) { currentUser = res.data.user; updateAuthUI(); await checkSession(); }
+        
+        if (res.data.user) { 
+            currentUser = res.data.user; 
+            updateAuthUI(); 
+            await checkSession(); 
+            if (type === 'signup') {
+                openProfileModal(true);
+            }
+        }
     } catch(e) { 
-        if (e.message.includes('Failed to fetch')) showToast("❌ 网络超时！请尝试切换网络/开启代理");
+        if (e.message.includes('Failed to fetch')) showToast("❌ 网络连接失败！请开启代理/VPN");
+        else if (e.message.includes('Invalid login credentials')) showToast("❌ 账号或密码错误！");
         else showToast("失败：" + e.message); 
     }
 }
@@ -91,58 +102,85 @@ async function handleLogout() {
     if(supabaseClient) await supabaseClient.auth.signOut();
     currentUser = null;
     document.getElementById('user-profile-area').style.display = 'none';
+    document.getElementById('logout-btn').style.display = 'none';
     document.getElementById('auth-btn').style.display = 'block';
     document.getElementById('profile-overlay').classList.remove('active');
     renderWorkspace(); await pullFromCloud();
+    showToast("已退出登录");
 }
 
 function updateAuthUI() {
     if (currentUser) {
         document.getElementById('auth-btn').style.display = 'none';
         document.getElementById('user-profile-area').style.display = 'flex';
+        document.getElementById('logout-btn').style.display = 'block';
         
-        // 核心修复：按账号 ID 隔离读取本地缓存，防止串号
         const profile = globalProfilesCache[currentUser.id];
         const savedAvatar = (profile && profile.avatar_url) ? profile.avatar_url : (safeGetLocal('user_avatar_' + currentUser.id) || DEFAULT_AVATAR);
         const savedName = (profile && profile.username) ? profile.username : (safeGetLocal('user_name_' + currentUser.id) || currentUser.email.split('@')[0]);
         
         document.getElementById('nav-avatar').src = savedAvatar;
         document.getElementById('nav-username').innerText = savedName;
-        document.getElementById('profile-avatar').src = savedAvatar;
-        document.getElementById('profile-avatar-input').value = savedAvatar;
-        document.getElementById('profile-name-input').value = savedName;
+    } else {
+        document.getElementById('user-profile-area').style.display = 'none';
+        document.getElementById('logout-btn').style.display = 'none';
+        document.getElementById('auth-btn').style.display = 'block';
     }
 }
 
-function openProfileModal() { document.getElementById('profile-overlay').classList.add('active'); }
+function openProfileModal(isForced = false) { 
+    if (currentUser) {
+        const profile = globalProfilesCache[currentUser.id];
+        document.getElementById('profile-name-input').value = profile ? profile.username : (safeGetLocal('user_name_' + currentUser.id) || '');
+        document.getElementById('profile-avatar-input').value = profile ? profile.avatar_url : (safeGetLocal('user_avatar_' + currentUser.id) || '');
+        document.getElementById('profile-bio-input').value = profile ? profile.bio : (safeGetLocal('user_bio_' + currentUser.id) || '');
+        document.getElementById('profile-avatar').src = document.getElementById('profile-avatar-input').value || DEFAULT_AVATAR;
+    }
+    
+    const titleEl = document.getElementById('profile-modal-title');
+    const cancelBtn = document.getElementById('profile-cancel-btn');
+    
+    if (isForced) {
+        titleEl.innerText = '🎉 欢迎加入！请完善您的资料';
+        cancelBtn.style.display = 'none';
+    } else {
+        titleEl.innerText = '编辑个人资料';
+        cancelBtn.style.display = 'block';
+    }
+    
+    document.getElementById('profile-overlay').classList.add('active'); 
+}
 
 async function saveProfile() {
-    const newName = document.getElementById('profile-name-input').value;
-    const newAvatar = document.getElementById('profile-avatar-input').value;
+    const newName = document.getElementById('profile-name-input').value.trim();
+    const newAvatar = document.getElementById('profile-avatar-input').value.trim();
+    const newBio = document.getElementById('profile-bio-input').value.trim();
+    
+    if (!newName) return showToast("昵称不能为空！");
     if (!currentUser) return;
     
-    // 核心修复：按账号 ID 隔离存储
     safeSetLocal('user_name_' + currentUser.id, newName);
     safeSetLocal('user_avatar_' + currentUser.id, newAvatar);
+    safeSetLocal('user_bio_' + currentUser.id, newBio);
 
     const stories = getStories();
     stories.forEach(s => {
-        if (s.user_id === currentUser.id) { s.author = newName; s.author_avatar = newAvatar; }
+        if (s.user_id === currentUser.id) { s.author = newName; s.author_avatar = newAvatar || DEFAULT_AVATAR; }
     });
     saveStories(stories);
 
     if (supabaseClient) {
         try {
             const { error } = await supabaseClient.from('profiles').upsert({
-                id: currentUser.id, username: newName, avatar_url: newAvatar, updated_at: new Date().toISOString()
+                id: currentUser.id, username: newName, avatar_url: newAvatar || DEFAULT_AVATAR, bio: newBio, updated_at: new Date().toISOString()
             });
-            if (!error) globalProfilesCache[currentUser.id] = { username: newName, avatar_url: newAvatar };
+            if (!error) globalProfilesCache[currentUser.id] = { username: newName, avatar_url: newAvatar || DEFAULT_AVATAR, bio: newBio };
         } catch (e) {}
     }
 
     updateAuthUI(); 
     document.getElementById('profile-overlay').classList.remove('active'); 
-    showToast("已保存");
+    showToast("资料已保存");
     if (window.location.hash.startsWith('#profile/')) renderProfilePage();
 }
 
@@ -158,13 +196,16 @@ async function renderProfilePage() {
     
     let userName = `作者_${targetId.substring(0,5)}`; 
     let userAvatar = DEFAULT_AVATAR; 
+    let userBio = '这个人很懒，什么都没有留下。';
 
     if (globalProfilesCache[targetId] && globalProfilesCache[targetId].username) {
         userName = globalProfilesCache[targetId].username;
         userAvatar = globalProfilesCache[targetId].avatar_url || DEFAULT_AVATAR;
+        if (globalProfilesCache[targetId].bio) userBio = globalProfilesCache[targetId].bio;
     } else if (isMe) {
         userName = safeGetLocal('user_name_' + targetId) || (currentUser.email ? currentUser.email.split('@')[0] : '我的主页');
         userAvatar = safeGetLocal('user_avatar_' + targetId) || DEFAULT_AVATAR;
+        userBio = safeGetLocal('user_bio_' + targetId) || '这个人很懒，什么都没有留下。';
     } else {
         const authorStories = localStoriesCache.filter(s => s.user_id === targetId);
         if (authorStories.length > 0) {
@@ -175,6 +216,7 @@ async function renderProfilePage() {
     
     document.getElementById('prof-big-avatar').src = userAvatar;
     document.getElementById('prof-big-name').innerText = userName;
+    document.getElementById('prof-bio').innerText = userBio;
 
     const works = localStoriesCache.filter(s => s.user_id === targetId && s.status === 'public' || (isMe && s.user_id === targetId));
     document.getElementById('prof-works-list').innerHTML = works.map(s => `
