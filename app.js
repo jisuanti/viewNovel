@@ -210,6 +210,18 @@ function router() {
     document.querySelectorAll('.view').forEach(v => { v.classList.remove('active'); v.style.display = 'none'; });
     const showView = (id) => { const el = document.getElementById(id); if (el) { el.classList.add('active'); el.style.display = 'block'; window.scrollTo(0, 0); } };
 
+    // 动态控制右上角按钮的文字和跳转
+    const navBtn = document.getElementById('nav-square-btn');
+    if (navBtn) {
+        if (parts[0] === '#square') {
+            navBtn.innerText = '返回工作台';
+            navBtn.onclick = () => location.hash = '#workspace';
+        } else {
+            navBtn.innerText = '故事广场';
+            navBtn.onclick = () => location.hash = '#square';
+        }
+    }
+
     if (parts[0] === '#workspace') { showView('view-workspace'); renderWorkspace(); } 
     else if (parts[0] === '#square') { showView('view-square'); renderSquare(); }
     else if (parts[0] === '#profile') { showView('view-profile'); renderProfilePage(); }
