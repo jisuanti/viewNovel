@@ -5,15 +5,13 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 let supabaseClient = null;
 let currentUser = null;
 let localStoriesCache = []; 
-let currentViewingProfile = null; 
+let globalProfilesCache = {}; 
+const DEFAULT_AVATAR = 'https://img.remit.ee/i/NFKpxA6gUtZs';
 
-// ================= 安全与工具 =================
+// ================= 工具与安全 =================
 function safeGetLocal(k){try{return localStorage.getItem(k)}catch(e){return null}}
 function safeSetLocal(k,v){try{localStorage.setItem(k,v)}catch(e){}}
 function safeBind(id,e,f){const el=document.getElementById(id);if(el)el[e]=f}
-
-// 把默认的丑头像换成了你的专属链接
-const DEFAULT_AVATAR = 'https://img.remit.ee/i/NFKpxA6gUtZs';
 
 // ================= 初始化 =================
 function initApp() {
@@ -26,7 +24,7 @@ function initApp() {
         safeSetLocal('vn_stories', JSON.stringify(localStoriesCache));
     }
 
-    router(); // 先渲染本地
+    router(); 
 
     if (typeof window.supabase !== 'undefined') {
         try {
@@ -44,7 +42,7 @@ function getDefaultStory() {
     for (let y = 0; y < 40; y++) { for (let x = 0; x < 40; x++) { let idx = y * 40 + x; if (x < 20) map[idx] = '#2E8B57'; if (x >= 25) map[idx] = '#4682B4'; if (x >= 15 && x < 25 && y > 20) map[idx] = '#4682B4'; if (x >= 20 && x < 25 && y <= 20) map[idx] = '#2E8B57'; } }
     return {
         id: 'story_1793443325138', title: 'Rainative', author: '寒流偏暖', author_avatar: DEFAULT_AVATAR, intro: '这是一个关于末日、大雨和希望的故事...', status: 'private', cover: 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop', tags: [], chapters: [], 
-        characters: [{ id: 'char_1', name: '我', desc: '主角，可男可女' }, { id: 'char_2', name: '露薇娅', desc: '你在天台遇到的白毛少女，她拥有深邃的蓝瞳孔，飘逸洁白的长发和柔软的白色连衣裙，看起来与这个世界格格不入，她会是谁呢......？' }, { id: 'char_3', name: '苏珊', desc: '你们因为一碗蘑菇汤相识成为朋友，在绝境中萌生的善意、向着太阳的希望，教会你打败其他人、脱离苦海的是......' }],
+        characters: [{ id: 'char_1', name: '我', desc: '主角，可男可女' }, { id: 'char_2', name: '露薇娅', desc: '你在天台遇到的白毛少女...' }, { id: 'char_3', name: '苏珊', desc: '你们因为一碗蘑菇汤相识...' }],
         plots: [{ id: 'plot_1', title: '大楼', desc: '末日后的安全屋', x: 25, y: 55 }], wiki: [], relationships: [], mapGrid: map, is_draft: true 
     };
 }
@@ -54,13 +52,24 @@ async function checkSession() {
     try {
         const { data: { session } } = await supabaseClient.auth.getSession();
         if (session) { currentUser = session.user; updateAuthUI(); }
-        document.getElementById('cloud-status').innerText = '🟢 已连接云端';
-        document.getElementById('cloud-status').style.color = '#52c41a';
+        
+        const statusEl = document.getElementById('cloud-status');
+        if(statusEl) { statusEl.innerText = '🟢 已连接云端'; statusEl.style.color = '#52c41a'; }
+        
+        // 核心修复：自动拉取所有人的资料缓存
+        try {
+            const { data: profiles } = await supabaseClient.from('profiles').select('*');
+            if (profiles) { profiles.forEach(p => { globalProfilesCache[p.id] = p; }); }
+        } catch(e) {}
+        
         await pullFromCloud(); 
-    } catch(e) { document.getElementById('cloud-status').innerText = '🔴 连接失败'; }
+    } catch(e) { 
+        const statusEl = document.getElementById('cloud-status');
+        if(statusEl) statusEl.innerText = '🔴 连接失败'; 
+    }
 }
 
-// ================= 账号与主页 =================
+// ================= 账号系统 =================
 function openAuthModal() { const el = document.getElementById('auth-overlay'); if(el) el.classList.add('active'); }
 async function handleAuth(type) {
     if(!supabaseClient) return showToast("云端未连接");
@@ -71,13 +80,10 @@ async function handleAuth(type) {
         let res = type === 'login' ? await supabaseClient.auth.signInWithPassword({ email, password }) : await supabaseClient.auth.signUp({ email, password });
         if (res.error) throw res.error;
         showToast("操作成功"); document.getElementById('auth-overlay').classList.remove('active');
-        if (res.data.user) { currentUser = res.data.user; updateAuthUI(); await pullFromCloud(); }
+        if (res.data.user) { currentUser = res.data.user; updateAuthUI(); await checkSession(); }
     } catch(e) { 
-        if (e.message.includes('Failed to fetch') || e.message.includes('NetworkError')) {
-            showToast("❌ 网络被墙或超时！请开启代理/VPN，或连接手机热点后再试！");
-        } else {
-            showToast("失败：" + e.message); 
-        }
+        if (e.message.includes('Failed to fetch')) showToast("❌ 网络超时！请尝试切换网络/开启代理");
+        else showToast("失败：" + e.message); 
     }
 }
 
@@ -94,8 +100,11 @@ function updateAuthUI() {
     if (currentUser) {
         document.getElementById('auth-btn').style.display = 'none';
         document.getElementById('user-profile-area').style.display = 'flex';
-        const savedAvatar = safeGetLocal('user_avatar') || DEFAULT_AVATAR;
-        const savedName = safeGetLocal('user_name') || currentUser.email.split('@')[0];
+        
+        // 核心修复：按账号 ID 隔离读取本地缓存，防止串号
+        const profile = globalProfilesCache[currentUser.id];
+        const savedAvatar = (profile && profile.avatar_url) ? profile.avatar_url : (safeGetLocal('user_avatar_' + currentUser.id) || DEFAULT_AVATAR);
+        const savedName = (profile && profile.username) ? profile.username : (safeGetLocal('user_name_' + currentUser.id) || currentUser.email.split('@')[0]);
         
         document.getElementById('nav-avatar').src = savedAvatar;
         document.getElementById('nav-username').innerText = savedName;
@@ -107,23 +116,28 @@ function updateAuthUI() {
 
 function openProfileModal() { document.getElementById('profile-overlay').classList.add('active'); }
 
-// [修复] 保存资料时，顺便更新你名下所有小说的作者名和头像
-function saveProfile() {
+async function saveProfile() {
     const newName = document.getElementById('profile-name-input').value;
     const newAvatar = document.getElementById('profile-avatar-input').value;
+    if (!currentUser) return;
     
-    safeSetLocal('user_name', newName);
-    safeSetLocal('user_avatar', newAvatar);
+    // 核心修复：按账号 ID 隔离存储
+    safeSetLocal('user_name_' + currentUser.id, newName);
+    safeSetLocal('user_avatar_' + currentUser.id, newAvatar);
 
-    if (currentUser) {
-        const stories = getStories();
-        stories.forEach(s => {
-            if (s.user_id === currentUser.id) {
-                s.author = newName; 
-                s.author_avatar = newAvatar; // 把头像也塞进小说数据里
-            }
-        });
-        saveStories(stories);
+    const stories = getStories();
+    stories.forEach(s => {
+        if (s.user_id === currentUser.id) { s.author = newName; s.author_avatar = newAvatar; }
+    });
+    saveStories(stories);
+
+    if (supabaseClient) {
+        try {
+            const { error } = await supabaseClient.from('profiles').upsert({
+                id: currentUser.id, username: newName, avatar_url: newAvatar, updated_at: new Date().toISOString()
+            });
+            if (!error) globalProfilesCache[currentUser.id] = { username: newName, avatar_url: newAvatar };
+        } catch (e) {}
     }
 
     updateAuthUI(); 
@@ -132,7 +146,6 @@ function saveProfile() {
     if (window.location.hash.startsWith('#profile/')) renderProfilePage();
 }
 
-// [修复] 未登录查看主页时，从作品反推名字和头像
 async function renderProfilePage() {
     const parts = window.location.hash.split('/');
     let targetId = parts[1];
@@ -146,15 +159,18 @@ async function renderProfilePage() {
     let userName = `作者_${targetId.substring(0,5)}`; 
     let userAvatar = DEFAULT_AVATAR; 
 
-    const authorStories = localStoriesCache.filter(s => s.user_id === targetId);
-    
-    if (isMe) {
-        userName = safeGetLocal('user_name') || (currentUser.email ? currentUser.email.split('@')[0] : '我的主页');
-        userAvatar = safeGetLocal('user_avatar') || DEFAULT_AVATAR;
-    } else if (authorStories.length > 0) {
-        // 未登录时，从他们的第一本书里把名字和头像薅出来
-        userName = authorStories[0].author || '未命名作者';
-        userAvatar = authorStories[0].author_avatar || DEFAULT_AVATAR;
+    if (globalProfilesCache[targetId] && globalProfilesCache[targetId].username) {
+        userName = globalProfilesCache[targetId].username;
+        userAvatar = globalProfilesCache[targetId].avatar_url || DEFAULT_AVATAR;
+    } else if (isMe) {
+        userName = safeGetLocal('user_name_' + targetId) || (currentUser.email ? currentUser.email.split('@')[0] : '我的主页');
+        userAvatar = safeGetLocal('user_avatar_' + targetId) || DEFAULT_AVATAR;
+    } else {
+        const authorStories = localStoriesCache.filter(s => s.user_id === targetId);
+        if (authorStories.length > 0) {
+            userName = authorStories[0].author || '未命名作者';
+            userAvatar = authorStories[0].author_avatar || DEFAULT_AVATAR;
+        }
     }
     
     document.getElementById('prof-big-avatar').src = userAvatar;
@@ -185,8 +201,7 @@ async function renderProfilePage() {
 
 async function toggleFollow() {
     if(!currentUser) return showToast("请先登录");
-    const parts = window.location.hash.split('/');
-    const targetId = parts[1];
+    const targetId = window.location.hash.split('/')[1];
     const btn = document.getElementById('btn-follow');
     const isFollowing = btn.innerText === '取消关注';
 
@@ -247,13 +262,8 @@ function router() {
 
     const navBtn = document.getElementById('nav-square-btn');
     if (navBtn) {
-        if (parts[0] === '#square') {
-            navBtn.innerText = '返回工作台';
-            navBtn.onclick = () => location.hash = '#workspace';
-        } else {
-            navBtn.innerText = '故事广场';
-            navBtn.onclick = () => location.hash = '#square';
-        }
+        if (parts[0] === '#square') { navBtn.innerText = '返回工作台'; navBtn.onclick = () => location.hash = '#workspace'; }
+        else { navBtn.innerText = '故事广场'; navBtn.onclick = () => location.hash = '#square'; }
     }
 
     if (parts[0] === '#workspace') { showView('view-workspace'); renderWorkspace(); } 
@@ -287,7 +297,7 @@ function closeConfirm() { document.getElementById('confirm-overlay').classList.r
 const getStories = () => localStoriesCache;
 const saveStories = (data) => { if (!Array.isArray(data)) return; localStoriesCache = data; safeSetLocal('vn_stories', JSON.stringify(localStoriesCache)); };
 
-// ================= 工作台与广场渲染 =================
+// ================= 工作台与广场 =================
 function renderWorkspace() {
     const container = document.getElementById('workspace-list');
     if (!container) return;
@@ -298,21 +308,14 @@ function renderWorkspace() {
         const isUnbound = !s.user_id; 
         
         let syncStatus = '';
-        if (isMine) {
-            syncStatus = s.is_draft ? '<span style="color:#c0a062;"> [本地草稿]</span>' : '<span style="color:#52c41a;"> [已发布]</span>';
-        } else if (isUnbound) {
-            syncStatus = '<span style="color:#c0a062;"> [本地私密]</span>';
-        } else {
-            syncStatus = '<span style="color:#52c41a;"> [云端作品]</span>';
-        }
+        if (isMine) { syncStatus = s.is_draft ? '<span style="color:#c0a062;"> [本地草稿]</span>' : '<span style="color:#52c41a;"> [已发布]</span>'; } 
+        else if (isUnbound) { syncStatus = '<span style="color:#c0a062;"> [本地私密]</span>'; } 
+        else { syncStatus = '<span style="color:#52c41a;"> [云端作品]</span>'; }
 
         let uploadBtn = '';
         if (isMine || isUnbound) {
-            if (currentUser) {
-                uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px;" onclick="event.stopPropagation(); uploadToCloud('${s.id}')">☁️ ${isUnbound?'绑定并发布':'更新'}</button>`;
-            } else {
-                uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px; background:#666;" onclick="event.stopPropagation(); showToast('请先登录');">登录后发布</button>`;
-            }
+            if (currentUser) { uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px;" onclick="event.stopPropagation(); uploadToCloud('${s.id}')">☁️ ${isUnbound?'绑定并发布':'更新'}</button>`; } 
+            else { uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px; background:#666;" onclick="event.stopPropagation(); showToast('请先登录');">登录后发布</button>`; }
         }
         
         const canManage = isMine || isUnbound;
@@ -327,9 +330,7 @@ function renderWorkspace() {
 }
 
 function renderSquare() {
-    const list = localStoriesCache.filter(s => {
-        return s.is_draft === false && s.status === 'public';
-    });
+    const list = localStoriesCache.filter(s => s.is_draft === false && s.status === 'public');
     const el = document.getElementById('story-list');
     if(el) {
         el.innerHTML = list.map(s => `
@@ -341,6 +342,7 @@ function renderSquare() {
     }
 }
 
+// ================= 故事管理 =================
 function renderManageMain() {
     const story = getStories().find(s => s.id === currentManageId); if (!story) return location.hash = '#workspace';
     document.getElementById('manage-title').innerText = story.title || '未命名';
@@ -417,7 +419,6 @@ function renderDetail(id) {
     document.getElementById('detail-tags').innerHTML = (story.tags || []).map(t => `<span>${t}</span>`).join(''); 
     document.getElementById('detail-intro').innerText = story.intro || '';
     
-    // 渲染百科词条
     const area = document.getElementById('detail-wiki-area'); area.innerHTML = '';
     const wikiList = story.wiki || [];
     if (wikiList.length === 0) {
@@ -434,7 +435,6 @@ function renderDetail(id) {
         });
     }
 
-    // 渲染地图 (支持鼠标悬停与手机点击)
     const mapArea = document.getElementById('detail-map-area');
     if (story.mapGrid && story.mapGrid.some(c => c !== 'transparent')) {
         let gridHtml = `<div style="display:grid; grid-template-columns:repeat(40, 1fr); grid-template-rows:repeat(40, 1fr); width:100%; aspect-ratio:1/1; position:relative; background:#1a1a24;">`;
@@ -451,7 +451,6 @@ function renderDetail(id) {
         mapArea.innerHTML = gridHtml;
     } else { mapArea.innerHTML = `<div style="display:flex; justify-content:center; align-items:center; height:100%; color:#666;">暂无地图</div>`; }
 
-    // 渲染关系图
     const relArea = document.getElementById('detail-relation-area');
     const chars = story.characters || []; let rels = story.relationships || [];
     if (chars.length < 2) { relArea.innerHTML = `<div style="display:flex; justify-content:center; align-items:center; height:100%; color:#666;">角色太少</div>`; } 
@@ -474,7 +473,6 @@ function renderDetail(id) {
     else { btn.innerText = "开始观看"; btn.style.background = "#fff"; btn.onclick = () => { window.location.hash = `#play/${story.id}/${chapters[0].id}`; }; }
 }
 
-// 提示框逻辑
 function showMapTooltip(el, title, desc) {
     let tooltip = document.getElementById('map-tooltip');
     const mapArea = document.getElementById('detail-map-area');
@@ -498,12 +496,7 @@ function showMapTooltip(el, title, desc) {
     tooltip.style.left = `${left}px`;
     tooltip.style.top = `${top}px`;
 }
-
-function hideMapTooltip() {
-    const tooltip = document.getElementById('map-tooltip');
-    if(tooltip) tooltip.style.display = 'none';
-}
-
+function hideMapTooltip() { const tooltip = document.getElementById('map-tooltip'); if(tooltip) tooltip.style.display = 'none'; }
 document.addEventListener('click', function(e) {
     const tooltip = document.getElementById('map-tooltip');
     if (tooltip && tooltip.style.display === 'block') {
@@ -612,7 +605,6 @@ function addNode(type) {
 }
 function deleteNode(e, id) { e.stopPropagation(); showConfirm("删除", "确认删除节点？", () => { const st = getStories().find(s => s.id === currentManageId), ch = st.chapters.find(c => c.id === currentChapterId); ch.nodes = ch.nodes.filter(n => n.id !== id); ch.edges = ch.edges.filter(e => e.from !== id && e.to !== id); saveStories(getStories()); renderNodeEditor(); }); }
 
-// ================= 编辑节点弹窗 =================
 function editNode(id) {
     const story = getStories().find(s => s.id === currentManageId), ch = story.chapters.find(c => c.id === currentChapterId), node = ch.nodes.find(n => n.id === id);
     if (!node || node.type === 'start') return showToast("此节点不可编辑");
@@ -648,7 +640,6 @@ function editNode(id) {
     });
 }
 
-// ================= 弹出与保存 =================
 function openAddChapterModal() { openModal("新章节", `<input type="text" id="m-ch-title" placeholder="标题">`, () => { const t = document.getElementById('m-ch-title').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); s.chapters.push({ id: 'ch_'+Date.now(), title: t, nodes: [], edges: [] }); saveStories(getStories()); renderManageSubPage('chapters'); }); }
 function openAddCharacterModal() { openModal("新角色", `<input type="text" id="m-c-name" placeholder="名字"><textarea id="m-c-desc" rows="3" placeholder="简介" style="margin-top:10px;"></textarea>`, () => { const n = document.getElementById('m-c-name').value; if(!n) return; const s = getStories().find(x => x.id === currentManageId); s.characters.push({ id: 'char_'+Date.now(), name: n, desc: document.getElementById('m-c-desc').value }); saveStories(getStories()); renderManageSubPage('characters'); }); }
 function openAddPlotModal() { openModal("新地点", `<input type="text" id="m-p-title" placeholder="名称"><textarea id="m-p-desc" rows="3" placeholder="描述" style="margin-top:10px;"></textarea>`, () => { const t = document.getElementById('m-p-title').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); s.plots.push({ id: 'plot_'+Date.now(), title: t, desc: document.getElementById('m-p-desc').value, x: 50, y: 50 }); saveStories(getStories()); renderManageSubPage('plots'); }); }
@@ -668,7 +659,6 @@ function renderRelationshipGraph() {
     area.innerHTML = svg + `</svg>`;
 }
 
-// ================= 导出与导入 =================
 function exportData() { const dataStr = JSON.stringify(localStoriesCache, null, 2); const blob = new Blob([dataStr], {type: "application/json"}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `backup.json`; a.click(); }
 function importData(e) { const f = e.target.files[0]; if(!f) return; const r = new FileReader(); r.onload = (ev) => { try { let imp = JSON.parse(ev.target.result); if(!Array.isArray(imp)) imp = imp.stories || [imp]; let nc = [...localStoriesCache]; imp.forEach(x => { if(x.id && x.title) { const idx = nc.findIndex(y => y.id === x.id); if(idx === -1) nc.push(x); else nc[idx] = x; } }); saveStories(nc); renderWorkspace(); showToast("导入成功"); } catch(err) { showToast("格式错误"); } }; r.readAsText(f); }
 
@@ -748,7 +738,6 @@ function renderMapEditor() {
 }
 function drawCell(c, i) { c.style.backgroundColor = brushColor; const s = getStories().find(x => x.id === currentManageId); if (!s.mapGrid) s.mapGrid = new Array(1600).fill('transparent'); s.mapGrid[i] = brushColor; saveStories(getStories()); }
 
-// ================= 创建小说 =================
 function openCreateStoryModal() {
     openModal("创建新小说", `<div class="form-group"><label>标题</label><input type="text" id="m-title" value=""></div>`, () => {
         const title = document.getElementById('m-title').value; if(!title) return showToast("请输入标题");
