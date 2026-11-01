@@ -70,7 +70,6 @@ async function handleAuth(type) {
         showToast("操作成功"); document.getElementById('auth-overlay').classList.remove('active');
         if (res.data.user) { currentUser = res.data.user; updateAuthUI(); await pullFromCloud(); }
     } catch(e) { 
-        // 拦截网络错误，给出明确中文提示
         if (e.message.includes('Failed to fetch') || e.message.includes('NetworkError')) {
             showToast("❌ 网络被墙或超时！请开启代理/VPN，或连接手机热点后再试！");
         } else {
@@ -210,7 +209,6 @@ function router() {
     document.querySelectorAll('.view').forEach(v => { v.classList.remove('active'); v.style.display = 'none'; });
     const showView = (id) => { const el = document.getElementById(id); if (el) { el.classList.add('active'); el.style.display = 'block'; window.scrollTo(0, 0); } };
 
-    // 动态控制右上角按钮的文字和跳转
     const navBtn = document.getElementById('nav-square-btn');
     if (navBtn) {
         if (parts[0] === '#square') {
@@ -252,6 +250,7 @@ function closeConfirm() { document.getElementById('confirm-overlay').classList.r
 
 const getStories = () => localStoriesCache;
 const saveStories = (data) => { if (!Array.isArray(data)) return; localStoriesCache = data; safeSetLocal('vn_stories', JSON.stringify(localStoriesCache)); };
+
 // ================= 工作台与广场渲染 =================
 function renderWorkspace() {
     const container = document.getElementById('workspace-list');
@@ -260,7 +259,6 @@ function renderWorkspace() {
     
     container.innerHTML = localStoriesCache.map(s => {
         const isMine = currentUser && s.user_id === currentUser.id;
-        // 如果本地有 user_id，说明曾经绑定过，只是现在没登录或云端没同步过来
         const isUnbound = !s.user_id; 
         
         let syncStatus = '';
@@ -269,11 +267,10 @@ function renderWorkspace() {
         } else if (isUnbound) {
             syncStatus = '<span style="color:#c0a062;"> [本地私密]</span>';
         } else {
-            syncStatus = '<span style="color:#52c41a;"> [云端作品]</span>'; // 别人的或者断网时的自己作品
+            syncStatus = '<span style="color:#52c41a;"> [云端作品]</span>';
         }
 
         let uploadBtn = '';
-        // 只有自己的或者没绑定的草稿才显示上传按钮
         if (isMine || isUnbound) {
             if (currentUser) {
                 uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px;" onclick="event.stopPropagation(); uploadToCloud('${s.id}')">☁️ ${isUnbound?'绑定并发布':'更新'}</button>`;
@@ -295,8 +292,6 @@ function renderWorkspace() {
 
 function renderSquare() {
     const list = localStoriesCache.filter(s => {
-        // 只要不是草稿，且状态是公开的，就显示在广场
-        // 注意：就算你是作者，只要状态是公开的，广场也会显示
         return s.is_draft === false && s.status === 'public';
     });
     const el = document.getElementById('story-list');
@@ -372,34 +367,55 @@ function deleteItem(type, id) {
     });
 }
 
-// ================= 详情页 =================
+// ================= 详情页 (百科与地图修复区) =================
 function goToAuthorProfile() {
     if(currentDetailStory && currentDetailStory.user_id) window.location.hash = `#profile/${currentDetailStory.user_id}`;
     else showToast("该作者未绑定账号");
 }
+
 function renderDetail(id) {
     const story = getStories().find(s => s.id === id); if (!story) return;
     document.getElementById('detail-cover').src = story.cover || 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop';
-    document.getElementById('detail-title').innerText = story.title; document.getElementById('detail-author').innerText = `作者：${story.author || '未知'}`;
-    document.getElementById('detail-tags').innerHTML = (story.tags || []).map(t => `<span>${t}</span>`).join(''); document.getElementById('detail-intro').innerText = story.intro || '';
+    document.getElementById('detail-title').innerText = story.title; 
+    document.getElementById('detail-author').innerText = `作者：${story.author || '未知'}`;
+    document.getElementById('detail-tags').innerHTML = (story.tags || []).map(t => `<span>${t}</span>`).join(''); 
+    document.getElementById('detail-intro').innerText = story.intro || '';
     
+    // 渲染百科词条
     const area = document.getElementById('detail-wiki-area'); area.innerHTML = '';
-    (story.wiki || []).forEach(w => {
-        let isUnlocked = true;
-        if (w.unlockChapter) { try { isUnlocked = JSON.parse(safeGetLocal('vn_read_history') || '[]').includes(w.unlockChapter); } catch(e){} }
-        if (isUnlocked) area.innerHTML += `<div style="background:#1e1e24; border:1px solid #333; border-radius:8px; padding:15px; min-width:200px;"><h4 style="color:#c0a062; margin-bottom:8px;">${w.term}</h4><p style="color:#ccc; font-size:0.9rem;">${w.content}</p></div>`;
-        else area.innerHTML += `<div style="background:#111; border:1px dashed #333; border-radius:8px; padding:15px; min-width:200px; display:flex; align-items:center; justify-content:center; color:#666;">🔒 阅读特定章节后解锁</div>`;
-    });
+    const wikiList = story.wiki || [];
+    if (wikiList.length === 0) {
+        area.innerHTML = '<div style="color:#666;">暂无词条</div>';
+    } else {
+        wikiList.forEach(w => {
+            let isUnlocked = true;
+            if (w.unlockChapter) { try { isUnlocked = JSON.parse(safeGetLocal('vn_read_history') || '[]').includes(w.unlockChapter); } catch(e){} }
+            if (isUnlocked) {
+                area.innerHTML += `<div style="background:#1e1e24; border:1px solid #333; border-radius:8px; padding:15px; min-width:200px;"><h4 style="color:#c0a062; margin-bottom:8px;">${w.term}</h4><p style="color:#ccc; font-size:0.9rem; line-height:1.5;">${w.content}</p></div>`;
+            } else {
+                area.innerHTML += `<div style="background:#111; border:1px dashed #333; border-radius:8px; padding:15px; min-width:200px; display:flex; align-items:center; justify-content:center; color:#666;">🔒 阅读特定章节后解锁</div>`;
+            }
+        });
+    }
 
+    // 渲染地图 (支持鼠标悬停与手机点击)
     const mapArea = document.getElementById('detail-map-area');
     if (story.mapGrid && story.mapGrid.some(c => c !== 'transparent')) {
         let gridHtml = `<div style="display:grid; grid-template-columns:repeat(40, 1fr); grid-template-rows:repeat(40, 1fr); width:100%; aspect-ratio:1/1; position:relative; background:#1a1a24;">`;
         story.mapGrid.forEach(color => { gridHtml += `<div style="background:${color}; width:100%; height:100%; border: 1px solid rgba(255,255,255,0.01);"></div>`; });
         gridHtml += `</div>`;
-        (story.plots || []).forEach(p => { gridHtml += `<div class="map-pin-detail" style="position:absolute; left:${p.x}%; top:${p.y}%; transform:translate(-50%,-50%); z-index:10; cursor:pointer;" onmouseenter="showMapTooltip(this, '${p.title}', '${(p.desc||'').replace(/'/g, "\\'")}')" onmouseleave="hideMapTooltip(this)"><div style="font-size:24px;">📍</div></div>`; });
+        (story.plots || []).forEach(p => { 
+            gridHtml += `<div class="map-pin-detail" style="position:absolute; left:${p.x}%; top:${p.y}%; transform:translate(-50%,-50%); z-index:10; cursor:pointer;" 
+                onmouseenter="showMapTooltip(this, '${p.title}', '${(p.desc||'').replace(/'/g, "\\'")}')" 
+                onmouseleave="hideMapTooltip(this)" 
+                onclick="event.stopPropagation(); showMapTooltip(this, '${p.title}', '${(p.desc||'').replace(/'/g, "\\'")}')">
+                <div style="font-size:24px;">📍</div>
+            </div>`; 
+        });
         mapArea.innerHTML = gridHtml;
     } else { mapArea.innerHTML = `<div style="display:flex; justify-content:center; align-items:center; height:100%; color:#666;">暂无地图</div>`; }
 
+    // 渲染关系图
     const relArea = document.getElementById('detail-relation-area');
     const chars = story.characters || []; let rels = story.relationships || [];
     if (chars.length < 2) { relArea.innerHTML = `<div style="display:flex; justify-content:center; align-items:center; height:100%; color:#666;">角色太少</div>`; } 
@@ -421,6 +437,43 @@ function renderDetail(id) {
     if (chapters.length === 0) { btn.innerText = "暂无章节"; btn.style.background = "#ccc"; btn.onclick = () => showToast("作者还没写呢！"); } 
     else { btn.innerText = "开始观看"; btn.style.background = "#fff"; btn.onclick = () => { window.location.hash = `#play/${story.id}/${chapters[0].id}`; }; }
 }
+
+// 提示框逻辑
+function showMapTooltip(el, title, desc) {
+    let tooltip = document.getElementById('map-tooltip');
+    const mapArea = document.getElementById('detail-map-area');
+    if(!tooltip) {
+        tooltip = document.createElement('div');
+        tooltip.id = 'map-tooltip';
+        tooltip.style.cssText = 'position:absolute; background:rgba(0,0,0,0.95); color:#fff; padding:10px; border-radius:8px; font-size:14px; z-index:100; pointer-events:none; border:1px solid #c0a062; white-space:nowrap; box-shadow:0 4px 10px rgba(0,0,0,0.5); transition: opacity 0.2s;';
+        if(mapArea) mapArea.appendChild(tooltip);
+    }
+    tooltip.innerHTML = `<div style="color:#c0a062; font-weight:bold; margin-bottom:5px;">${title}</div><div style="font-size:12px;">${desc || '暂无详细描述'}</div>`;
+    tooltip.style.display = 'block';
+    
+    const pinRect = el.getBoundingClientRect();
+    const areaRect = mapArea.getBoundingClientRect();
+    let left = pinRect.left - areaRect.left + (pinRect.width / 2) - (tooltip.offsetWidth / 2);
+    let top = pinRect.top - areaRect.top - tooltip.offsetHeight - 10;
+    if (left < 0) left = 0;
+    if (left + tooltip.offsetWidth > areaRect.width) left = areaRect.width - tooltip.offsetWidth;
+    if (top < 0) top = pinRect.top - areaRect.top + pinRect.height + 10; 
+
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${top}px`;
+}
+
+function hideMapTooltip() {
+    const tooltip = document.getElementById('map-tooltip');
+    if(tooltip) tooltip.style.display = 'none';
+}
+
+document.addEventListener('click', function(e) {
+    const tooltip = document.getElementById('map-tooltip');
+    if (tooltip && tooltip.style.display === 'block') {
+        if (!e.target.closest('.map-pin-detail')) tooltip.style.display = 'none';
+    }
+});
 
 // ================= 节点编辑器 =================
 function renderNodeEditor() {
@@ -522,6 +575,7 @@ function addNode(type) {
     ch.nodes.push(newNode); saveStories(getStories()); renderNodeEditor();
 }
 function deleteNode(e, id) { e.stopPropagation(); showConfirm("删除", "确认删除节点？", () => { const st = getStories().find(s => s.id === currentManageId), ch = st.chapters.find(c => c.id === currentChapterId); ch.nodes = ch.nodes.filter(n => n.id !== id); ch.edges = ch.edges.filter(e => e.from !== id && e.to !== id); saveStories(getStories()); renderNodeEditor(); }); }
+
 // ================= 编辑节点弹窗 =================
 function editNode(id) {
     const story = getStories().find(s => s.id === currentManageId), ch = story.chapters.find(c => c.id === currentChapterId), node = ch.nodes.find(n => n.id === id);
