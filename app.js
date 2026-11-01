@@ -69,9 +69,15 @@ async function handleAuth(type) {
         if (res.error) throw res.error;
         showToast("操作成功"); document.getElementById('auth-overlay').classList.remove('active');
         if (res.data.user) { currentUser = res.data.user; updateAuthUI(); await pullFromCloud(); }
-    } catch(e) { showToast("失败：" + e.message); }
+    } catch(e) { 
+        // 拦截网络错误，给出明确中文提示
+        if (e.message.includes('Failed to fetch') || e.message.includes('NetworkError')) {
+            showToast("❌ 网络被墙或超时！请开启代理/VPN，或连接手机热点后再试！");
+        } else {
+            showToast("失败：" + e.message); 
+        }
+    }
 }
-
 async function handleLogout() {
     if(supabaseClient) await supabaseClient.auth.signOut();
     currentUser = null;
@@ -242,12 +248,27 @@ function renderWorkspace() {
     
     container.innerHTML = localStoriesCache.map(s => {
         const isMine = currentUser && s.user_id === currentUser.id;
+        // 如果本地有 user_id，说明曾经绑定过，只是现在没登录或云端没同步过来
         const isUnbound = !s.user_id; 
-        let syncStatus = isMine ? (s.is_draft ? '<span style="color:#c0a062;"> [本地草稿]</span>' : '<span style="color:#52c41a;"> [已发布]</span>') : (isUnbound ? '<span style="color:#c0a062;"> [本地私密]</span>' : '');
+        
+        let syncStatus = '';
+        if (isMine) {
+            syncStatus = s.is_draft ? '<span style="color:#c0a062;"> [本地草稿]</span>' : '<span style="color:#52c41a;"> [已发布]</span>';
+        } else if (isUnbound) {
+            syncStatus = '<span style="color:#c0a062;"> [本地私密]</span>';
+        } else {
+            syncStatus = '<span style="color:#52c41a;"> [云端作品]</span>'; // 别人的或者断网时的自己作品
+        }
+
         let uploadBtn = '';
-        if (isMine) uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px;" onclick="event.stopPropagation(); uploadToCloud('${s.id}')">☁️ 更新</button>`;
-        else if (isUnbound && currentUser) uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px; background:#52c41a;" onclick="event.stopPropagation(); uploadToCloud('${s.id}')">☁️ 绑定并发布</button>`;
-        else if (isUnbound && !currentUser) uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px; background:#666;" onclick="event.stopPropagation(); showToast('登录后发布');">登录后发布</button>`;
+        // 只有自己的或者没绑定的草稿才显示上传按钮
+        if (isMine || isUnbound) {
+            if (currentUser) {
+                uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px;" onclick="event.stopPropagation(); uploadToCloud('${s.id}')">☁️ ${isUnbound?'绑定并发布':'更新'}</button>`;
+            } else {
+                uploadBtn = `<button class="btn-gold" style="position:absolute; bottom:10px; right:10px; font-size:0.8rem; padding:5px 10px; background:#666;" onclick="event.stopPropagation(); showToast('请先登录');">登录后发布</button>`;
+            }
+        }
         
         const canManage = isMine || isUnbound;
         const targetHash = canManage ? `#manage/${s.id}` : `#detail/${s.id}`;
@@ -262,11 +283,19 @@ function renderWorkspace() {
 
 function renderSquare() {
     const list = localStoriesCache.filter(s => {
-        if (currentUser && s.user_id === currentUser.id) return s.status === 'public';
+        // 只要不是草稿，且状态是公开的，就显示在广场
+        // 注意：就算你是作者，只要状态是公开的，广场也会显示
         return s.is_draft === false && s.status === 'public';
     });
     const el = document.getElementById('story-list');
-    if(el) el.innerHTML = list.map(s => `<div class="story-card" onclick="location.hash = '#detail/${s.id}'"><img src="${s.cover || 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop'}"><div class="card-info"><h3>${s.title}</h3><p>作者：${s.author || '未知'}</p></div></div>`).join('') || '<div style="color:#888; padding:50px;">暂无公开作品</div>';
+    if(el) {
+        el.innerHTML = list.map(s => `
+            <div class="story-card" onclick="location.hash = '#detail/${s.id}'">
+                <img src="${s.cover || 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop'}">
+                <div class="card-info"><h3>${s.title}</h3><p>作者：${s.author || '未知'}</p></div>
+            </div>
+        `).join('') || '<div style="color:#888; padding:50px;">广场空空如也，快去发布你的作品吧！</div>';
+    }
 }
 
 function renderManageMain() {
