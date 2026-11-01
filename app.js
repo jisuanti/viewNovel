@@ -77,6 +77,7 @@ async function handleAuth(type) {
         }
     }
 }
+
 async function handleLogout() {
     if(supabaseClient) await supabaseClient.auth.signOut();
     currentUser = null;
@@ -101,13 +102,32 @@ function updateAuthUI() {
 }
 
 function openProfileModal() { document.getElementById('profile-overlay').classList.add('active'); }
+
+// [修复] 保存资料时，同步更新名下所有小说的作者名
 function saveProfile() {
-    safeSetLocal('user_avatar', document.getElementById('profile-avatar-input').value);
-    safeSetLocal('user_name', document.getElementById('profile-name-input').value);
-    updateAuthUI(); document.getElementById('profile-overlay').classList.remove('active'); showToast("已保存");
+    const newName = document.getElementById('profile-name-input').value;
+    const newAvatar = document.getElementById('profile-avatar-input').value;
+    
+    safeSetLocal('user_name', newName);
+    safeSetLocal('user_avatar', newAvatar);
+
+    if (currentUser) {
+        const stories = getStories();
+        stories.forEach(s => {
+            if (s.user_id === currentUser.id) {
+                s.author = newName; 
+            }
+        });
+        saveStories(stories);
+    }
+
+    updateAuthUI(); 
+    document.getElementById('profile-overlay').classList.remove('active'); 
+    showToast("已保存");
     if (window.location.hash.startsWith('#profile/')) renderProfilePage();
 }
 
+// [修复] 未登录或查看他人主页时，通过作品反推作者名
 async function renderProfilePage() {
     const parts = window.location.hash.split('/');
     let targetId = parts[1];
@@ -118,8 +138,17 @@ async function renderProfilePage() {
     document.getElementById('btn-follow').style.display = (isMe || !currentUser) ? 'none' : 'block';
     document.getElementById('btn-edit-profile').style.display = isMe ? 'block' : 'none';
     
-    const userName = isMe ? (safeGetLocal('user_name') || currentUser.email.split('@')[0]) : '其他作者';
-    const userAvatar = isMe ? (safeGetLocal('user_avatar') || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=100') : 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=100';
+    let userName = `作者_${targetId.substring(0,5)}`; 
+    let userAvatar = 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=100'; 
+
+    const authorStories = localStoriesCache.filter(s => s.user_id === targetId);
+    
+    if (isMe) {
+        userName = safeGetLocal('user_name') || (currentUser.email ? currentUser.email.split('@')[0] : '我的主页');
+        userAvatar = safeGetLocal('user_avatar') || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=100';
+    } else if (authorStories.length > 0) {
+        userName = authorStories[0].author || '未命名作者';
+    }
     
     document.getElementById('prof-big-avatar').src = userAvatar;
     document.getElementById('prof-big-name').innerText = userName;
@@ -367,7 +396,7 @@ function deleteItem(type, id) {
     });
 }
 
-// ================= 详情页 (百科与地图修复区) =================
+// ================= 详情页 =================
 function goToAuthorProfile() {
     if(currentDetailStory && currentDetailStory.user_id) window.location.hash = `#profile/${currentDetailStory.user_id}`;
     else showToast("该作者未绑定账号");
