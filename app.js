@@ -13,6 +13,15 @@ function safeGetLocal(k){try{return localStorage.getItem(k)}catch(e){return null
 function safeSetLocal(k,v){try{localStorage.setItem(k,v)}catch(e){}}
 function safeBind(id,e,f){const el=document.getElementById(id);if(el)el[e]=f}
 
+// ================= 作者显示 =================
+function displayAuthorOf(story) {
+    if (story && story.user_id && globalProfilesCache[story.user_id] && globalProfilesCache[story.user_id].username) {
+        const p = globalProfilesCache[story.user_id];
+        return { name: p.username, avatar: p.avatar_url || DEFAULT_AVATAR };
+    }
+    return { name: (story && story.author) || '未知', avatar: (story && story.author_avatar) || DEFAULT_AVATAR };
+}
+
 // ================= 初始化 =================
 function initApp() {
     const statusEl = document.getElementById('cloud-status');
@@ -58,9 +67,9 @@ async function checkSession() {
         } catch(e) {}
         
         updateAuthUI();
+        syncOwnStoriesAuthor();
         await pullFromCloud(); 
 
-        // 如果登录了，但从未设置过资料，强制弹窗
         if (currentUser && (!globalProfilesCache[currentUser.id] || !globalProfilesCache[currentUser.id].username)) {
             openProfileModal(true);
         }
@@ -117,7 +126,7 @@ function updateAuthUI() {
         
         const profile = globalProfilesCache[currentUser.id];
         const savedAvatar = (profile && profile.avatar_url) ? profile.avatar_url : (safeGetLocal('user_avatar_' + currentUser.id) || DEFAULT_AVATAR);
-        const savedName = (profile && profile.username) ? profile.username : (safeGetLocal('user_name_' + currentUser.id) || currentUser.email.split('@')[0]);
+        const savedName = (profile && profile.username) ? profile.username : (safeGetLocal('user_name_' + currentUser.id) || '未命名用户');
         
         document.getElementById('nav-avatar').src = savedAvatar;
         document.getElementById('nav-username').innerText = savedName;
@@ -131,10 +140,14 @@ function updateAuthUI() {
 function openProfileModal(isForced = false) { 
     if (currentUser) {
         const profile = globalProfilesCache[currentUser.id];
-        document.getElementById('profile-name-input').value = profile ? profile.username : (safeGetLocal('user_name_' + currentUser.id) || '');
-        document.getElementById('profile-avatar-input').value = profile ? profile.avatar_url : (safeGetLocal('user_avatar_' + currentUser.id) || '');
-        document.getElementById('profile-bio-input').value = profile ? profile.bio : (safeGetLocal('user_bio_' + currentUser.id) || '');
-        document.getElementById('profile-avatar').src = document.getElementById('profile-avatar-input').value || DEFAULT_AVATAR;
+        const currentName = profile ? profile.username : safeGetLocal('user_name_' + currentUser.id);
+        const currentAvatar = profile ? profile.avatar_url : safeGetLocal('user_avatar_' + currentUser.id);
+        const currentBio = profile ? profile.bio : safeGetLocal('user_bio_' + currentUser.id);
+
+        document.getElementById('profile-name-input').value = currentName || '';
+        document.getElementById('profile-avatar-input').value = currentAvatar || '';
+        document.getElementById('profile-bio-input').value = currentBio || '';
+        document.getElementById('profile-avatar').src = currentAvatar || DEFAULT_AVATAR;
     }
     
     const titleEl = document.getElementById('profile-modal-title');
@@ -153,11 +166,15 @@ function openProfileModal(isForced = false) {
 
 async function saveProfile() {
     const newName = document.getElementById('profile-name-input').value.trim();
-    const newAvatar = document.getElementById('profile-avatar-input').value.trim();
+    let newAvatar = document.getElementById('profile-avatar-input').value.trim();
     const newBio = document.getElementById('profile-bio-input').value.trim();
     
     if (!newName) return showToast("昵称不能为空！");
     if (!currentUser) return;
+    
+    if (!newAvatar) {
+        newAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(newName)}&background=random&color=fff&size=128`;
+    }
     
     safeSetLocal('user_name_' + currentUser.id, newName);
     safeSetLocal('user_avatar_' + currentUser.id, newAvatar);
@@ -165,16 +182,16 @@ async function saveProfile() {
 
     const stories = getStories();
     stories.forEach(s => {
-        if (s.user_id === currentUser.id) { s.author = newName; s.author_avatar = newAvatar || DEFAULT_AVATAR; }
+        if (s.user_id === currentUser.id) { s.author = newName; s.author_avatar = newAvatar; }
     });
     saveStories(stories);
 
     if (supabaseClient) {
         try {
             const { error } = await supabaseClient.from('profiles').upsert({
-                id: currentUser.id, username: newName, avatar_url: newAvatar || DEFAULT_AVATAR, bio: newBio, updated_at: new Date().toISOString()
+                id: currentUser.id, username: newName, avatar_url: newAvatar, bio: newBio, updated_at: new Date().toISOString()
             });
-            if (!error) globalProfilesCache[currentUser.id] = { username: newName, avatar_url: newAvatar || DEFAULT_AVATAR, bio: newBio };
+            if (!error) globalProfilesCache[currentUser.id] = { username: newName, avatar_url: newAvatar, bio: newBio };
         } catch (e) {}
     }
 
@@ -182,6 +199,25 @@ async function saveProfile() {
     document.getElementById('profile-overlay').classList.remove('active'); 
     showToast("资料已保存");
     if (window.location.hash.startsWith('#profile/')) renderProfilePage();
+}
+
+function syncOwnStoriesAuthor() {
+    if (!currentUser) return;
+    const p = globalProfilesCache[currentUser.id];
+    const name   = (p && p.username)   ? p.username   : safeGetLocal('user_name_'   + currentUser.id);
+    const avatar = (p && p.avatar_url) ? p.avatar_url : safeGetLocal('user_avatar_' + currentUser.id);
+    if (!name) return;
+
+    const stories = getStories();
+    let changed = false;
+    stories.forEach(s => {
+        if (s.user_id === currentUser.id && (s.author !== name || s.author_avatar !== (avatar || DEFAULT_AVATAR))) {
+            s.author = name;
+            s.author_avatar = avatar || DEFAULT_AVATAR;
+            changed = true;
+        }
+    });
+    if (changed) saveStories(stories);
 }
 
 async function renderProfilePage() {
@@ -194,7 +230,7 @@ async function renderProfilePage() {
     document.getElementById('btn-follow').style.display = (isMe || !currentUser) ? 'none' : 'block';
     document.getElementById('btn-edit-profile').style.display = isMe ? 'block' : 'none';
     
-    let userName = `作者_${targetId.substring(0,5)}`; 
+    let userName = '未知用户'; 
     let userAvatar = DEFAULT_AVATAR; 
     let userBio = '这个人很懒，什么都没有留下。';
 
@@ -203,7 +239,7 @@ async function renderProfilePage() {
         userAvatar = globalProfilesCache[targetId].avatar_url || DEFAULT_AVATAR;
         if (globalProfilesCache[targetId].bio) userBio = globalProfilesCache[targetId].bio;
     } else if (isMe) {
-        userName = safeGetLocal('user_name_' + targetId) || (currentUser.email ? currentUser.email.split('@')[0] : '我的主页');
+        userName = safeGetLocal('user_name_' + targetId) || '未命名用户';
         userAvatar = safeGetLocal('user_avatar_' + targetId) || DEFAULT_AVATAR;
         userBio = safeGetLocal('user_bio_' + targetId) || '这个人很懒，什么都没有留下。';
     } else {
@@ -280,6 +316,12 @@ async function pullFromCloud() {
 async function uploadToCloud(storyId) {
     if (!currentUser || !supabaseClient) return showToast("请登录");
     const story = localStoriesCache.find(s => s.id === storyId); if (!story) return;
+
+    const p = globalProfilesCache[currentUser.id];
+    story.author        = (p && p.username)   ? p.username   : (safeGetLocal('user_name_'   + currentUser.id) || '未命名用户');
+    story.author_avatar = (p && p.avatar_url) ? p.avatar_url : (safeGetLocal('user_avatar_' + currentUser.id) || DEFAULT_AVATAR);
+    story.user_id       = currentUser.id;
+
     showToast("上传中...");
     try {
         const { error } = await supabaseClient.from('stories').upsert({
@@ -288,7 +330,7 @@ async function uploadToCloud(storyId) {
             user_id: currentUser.id, is_draft: false
         }, { onConflict: 'id' });
         if (error) throw error;
-        story.is_draft = false; story.user_id = currentUser.id;
+        story.is_draft = false;
         safeSetLocal('vn_stories', JSON.stringify(localStoriesCache)); renderWorkspace(); showToast("已发布到云端");
     } catch(e) { showToast("失败：" + e.message); }
 }
@@ -301,6 +343,15 @@ function router() {
     const parts = hash.split('/');
     document.querySelectorAll('.view').forEach(v => { v.classList.remove('active'); v.style.display = 'none'; });
     const showView = (id) => { const el = document.getElementById(id); if (el) { el.classList.add('active'); el.style.display = 'block'; window.scrollTo(0, 0); } };
+
+    const globalHeader = document.getElementById('global-header');
+    if (globalHeader) {
+        if (parts[0] === '#play') {
+            globalHeader.style.display = 'none';
+        } else {
+            globalHeader.style.display = 'flex';
+        }
+    }
 
     const navBtn = document.getElementById('nav-square-btn');
     if (navBtn) {
@@ -328,6 +379,7 @@ function router() {
 }
 window.addEventListener('hashchange', router); window.addEventListener('load', initApp); 
 
+// ================= 工作台与广场 =================
 let toastTimer;
 function showToast(msg) { const t = document.getElementById('toast'); if(!t) return; document.getElementById('toast-text').innerText = msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 3000); }
 function openModal(title, html, cb) { document.getElementById('modal-title').innerText = title; document.getElementById('modal-content').innerHTML = html; document.getElementById('modal-overlay').classList.add('active'); document.getElementById('modal-confirm-btn').onclick = () => { cb(); closeModal(); }; }
@@ -339,7 +391,6 @@ function closeConfirm() { document.getElementById('confirm-overlay').classList.r
 const getStories = () => localStoriesCache;
 const saveStories = (data) => { if (!Array.isArray(data)) return; localStoriesCache = data; safeSetLocal('vn_stories', JSON.stringify(localStoriesCache)); };
 
-// ================= 工作台与广场 =================
 function renderWorkspace() {
     const container = document.getElementById('workspace-list');
     if (!container) return;
@@ -348,6 +399,7 @@ function renderWorkspace() {
     container.innerHTML = localStoriesCache.map(s => {
         const isMine = currentUser && s.user_id === currentUser.id;
         const isUnbound = !s.user_id; 
+        const au = displayAuthorOf(s);
         
         let syncStatus = '';
         if (isMine) { syncStatus = s.is_draft ? '<span style="color:#c0a062;"> [本地草稿]</span>' : '<span style="color:#52c41a;"> [已发布]</span>'; } 
@@ -365,7 +417,7 @@ function renderWorkspace() {
         return `
         <div class="story-card" style="position:relative;" onclick="location.hash = '${targetHash}'">
             <img src="${s.cover || 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop'}">
-            <div class="card-info"><h3>${s.title} ${syncStatus}</h3><p>作者：${s.author || '未知'}</p></div>
+            <div class="card-info"><h3>${s.title} ${syncStatus}</h3><p>作者：${au.name}</p></div>
             ${uploadBtn}
         </div>`;
     }).join('');
@@ -375,12 +427,14 @@ function renderSquare() {
     const list = localStoriesCache.filter(s => s.is_draft === false && s.status === 'public');
     const el = document.getElementById('story-list');
     if(el) {
-        el.innerHTML = list.map(s => `
+        el.innerHTML = list.map(s => {
+            const au = displayAuthorOf(s);
+            return `
             <div class="story-card" onclick="location.hash = '#detail/${s.id}'">
                 <img src="${s.cover || 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop'}">
-                <div class="card-info"><h3>${s.title}</h3><p>作者：${s.author || '未知'}</p></div>
-            </div>
-        `).join('') || '<div style="color:#888; padding:50px;">广场空空如也，快去发布你的作品吧！</div>';
+                <div class="card-info"><h3>${s.title}</h3><p>作者：${au.name}</p></div>
+            </div>`;
+        }).join('') || '<div style="color:#888; padding:50px;">广场空空如也，快去发布你的作品吧！</div>';
     }
 }
 
@@ -434,8 +488,10 @@ function renderManageSubPage(page) {
             <div class="list-item"><div class="list-item-content"><h4>${w.term}</h4><p>${w.content}</p></div><div class="list-item-actions"><button class="text-btn" style="color:#d9534f;" onclick="deleteItem('wiki', '${w.id}')">删除</button></div></div>
         `).join('') : `<div style="text-align:center;padding:50px;">暂无词条</div>`;
     } else if (page === 'edit') {
-        document.getElementById('edit-title').value = story.title || ''; document.getElementById('edit-author').value = story.author || '';
-        document.getElementById('edit-intro').value = story.intro || ''; document.getElementById('edit-tags').value = (story.tags || []).join('，'); document.getElementById('edit-cover').value = story.cover || '';
+        document.getElementById('edit-title').value = story.title || '';
+        document.getElementById('edit-intro').value = story.intro || '';
+        document.getElementById('edit-tags').value = (story.tags || []).join('，');
+        document.getElementById('edit-cover').value = story.cover || '';
     }
 }
 
@@ -455,9 +511,10 @@ function goToAuthorProfile() {
 
 function renderDetail(id) {
     const story = getStories().find(s => s.id === id); if (!story) return;
+    const au = displayAuthorOf(story);
     document.getElementById('detail-cover').src = story.cover || 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop';
     document.getElementById('detail-title').innerText = story.title; 
-    document.getElementById('detail-author').innerText = `作者：${story.author || '未知'}`;
+    document.getElementById('detail-author').innerText = `作者：${au.name}`;
     document.getElementById('detail-tags').innerHTML = (story.tags || []).map(t => `<span>${t}</span>`).join(''); 
     document.getElementById('detail-intro').innerText = story.intro || '';
     
@@ -550,7 +607,7 @@ document.addEventListener('click', function(e) {
 function renderNodeEditor() {
     const story = getStories().find(s => s.id === currentManageId); if(!story) return;
     const chapter = story.chapters.find(c => c.id === currentChapterId); if (!chapter) return;
-    document.getElementById('node-editor-title').innerText = chapter.title || '未命名章节';
+    
     const canvas = document.getElementById('node-canvas'); const svg = document.getElementById('node-svg');
     if(!canvas || !svg) return; canvas.innerHTML = ''; svg.innerHTML = '';
     if (!chapter.nodes) chapter.nodes = []; if (!chapter.edges) chapter.edges = [];
@@ -559,9 +616,13 @@ function renderNodeEditor() {
     if (!chapter.nodes.some(n => n.type === 'end')) { chapter.nodes.push({ id: 'n_end_' + Date.now(), type: 'end', x: 600, y: 150 }); needSave = true; }
     if (needSave) { saveStories(getStories()); }
 
+    // 错误检查统计
+    let totalErrors = 0;
+
     chapter.nodes.forEach(node => {
         if (!node || !node.type) return;
         if (node.type === 'branch' && (!node.options || node.options.length < 2)) { node.options = [{ text: '选项A' }, { text: '选项B' }]; }
+        
         let content = '';
         if (node.type === 'dialogue') content = `<b>${node.name || '角色'}</b>: ${node.text || '...'}`;
         else if (node.type === 'narration') content = `<span style="color:#888;">旁白:</span> ${node.text || '...'}`;
@@ -572,22 +633,55 @@ function renderNodeEditor() {
         else if (node.type === 'end') content = `🛑 结局: ${node.text ? node.text.substring(0, 10) + '...' : '未命名'}`;
         else content = '开始';
 
+        // ===== 连线错误校验逻辑 =====
+        let errs = [];
+        const outs = chapter.edges.filter(e => e.from === node.id);
+        const ins = chapter.edges.filter(e => e.to === node.id);
+
+        if (node.type !== 'start' && ins.length === 0) errs.push('缺少入口连线');
+        if (node.type !== 'end' && outs.length === 0) errs.push('缺少出口连线');
+        if (node.type === 'branch' && outs.length < 2) errs.push('分支未连满2条线');
+        if (node.type === 'end' && outs.length > 0) errs.push('结局节点不应有出口');
+        
+        if (errs.length > 0) totalErrors++;
+
         const div = document.createElement('div'); div.className = 'graph-node'; div.id = `node-${node.id}`; div.style.left = `${node.x || 100}px`; div.style.top = `${node.y || 100}px`;
+        
+        // 给有错误的节点加红框
+        if (errs.length > 0) {
+            div.style.border = '2px solid #ff4d4f';
+            div.style.boxShadow = '0 0 10px rgba(255, 77, 79, 0.5)';
+        }
+
         let inPort = node.type !== 'start' ? `<div class="node-port port-in port-left" data-node="${node.id}" data-dir="left"></div>` : '';
         let outPort = node.type === 'branch' ? `<div class="node-port port-out port-out-branch-1" data-node="${node.id}" data-branch="0" data-dir="right"></div><div class="node-port port-out port-out-branch-2" data-node="${node.id}" data-branch="1" data-dir="right"></div>` : (node.type !== 'end' ? `<div class="node-port port-out port-right" data-node="${node.id}" data-dir="right"></div>` : '');
         
-        div.innerHTML = `<div class="graph-node-header"><span>${node.type.toUpperCase()}</span><span style="cursor:pointer;color:red;" onclick="deleteNode(event, '${node.id}')">×</span></div><div class="graph-node-body" onclick="editNode('${node.id}')">${content}</div>${inPort}${outPort}`;
+        // pointer-events: none; 防止鼠标事件被拦截
+        let errIcon = errs.length > 0 ? `<div style="position:absolute; top:-10px; right:-10px; background:#ff4d4f; color:#fff; border-radius:50%; width:20px; height:20px; display:flex; justify-content:center; align-items:center; font-size:14px; z-index:10; pointer-events: none; box-shadow:0 2px 5px rgba(0,0,0,0.3);" title="${errs.join('，')}">!</div>` : '';
+
+        // 给删除按钮专门加一个类名 node-del-btn
+        div.innerHTML = `${errIcon}<div class="graph-node-header"><span>${node.type.toUpperCase()}</span><span class="node-del-btn" style="cursor:pointer;color:red;padding:0 5px;" onclick="deleteNode(event, '${node.id}')">×</span></div><div class="graph-node-body" onclick="editNode('${node.id}')">${content}</div>${inPort}${outPort}`;
         canvas.appendChild(div);
 
         const header = div.querySelector('.graph-node-header');
         header.onmousedown = (e) => {
-            if (e.target.tagName === 'SPAN') return;
+            // 修复：只有当点击的是 class="node-del-btn" 时才不拖动，点击其他任何地方都可以拖拽
+            if (e.target.classList.contains('node-del-btn')) return; 
             let startX = e.clientX - node.x, startY = e.clientY - node.y;
             const move = (ev) => { node.x = ev.clientX - startX; node.y = ev.clientY - startY; div.style.left = `${node.x}px`; div.style.top = `${node.y}px`; drawEdges(chapter.edges); };
             document.addEventListener('mousemove', move);
             document.addEventListener('mouseup', () => { document.removeEventListener('mousemove', move); saveStories(getStories()); }, { once: true });
         };
     });
+
+    // 在标题处显示错误汇总
+    const titleEl = document.getElementById('node-editor-title');
+    if (totalErrors > 0) {
+        titleEl.innerHTML = `${chapter.title || '未命名章节'} <span style="color:#ff4d4f; font-size:0.85rem; margin-left:10px; font-weight:normal;">⚠️ 发现 ${totalErrors} 个连线错误</span>`;
+    } else {
+        titleEl.innerHTML = `${chapter.title || '未命名章节'} <span style="color:#52c41a; font-size:0.85rem; margin-left:10px; font-weight:normal;">✅ 结构正常</span>`;
+    }
+
     drawEdges(chapter.edges); bindPorts(chapter);
 }
 
@@ -620,15 +714,39 @@ function bindPorts(chapter) {
             let x1 = dirA === 'right' ? nodeA.offsetLeft + nodeA.offsetWidth : nodeA.offsetLeft, y1 = nodeA.offsetTop + port.offsetTop + 8; 
             const svg = document.getElementById('node-svg');
             let tempPath = document.createElementNS('http://www.w3.org/2000/svg', 'path'); tempPath.setAttribute('d', `M ${x1} ${y1} L ${x1} ${y1}`); tempPath.setAttribute('stroke', '#c0a062'); tempPath.setAttribute('stroke-width', '3'); tempPath.setAttribute('stroke-dasharray', '5,5'); tempPath.setAttribute('fill', 'none'); svg.appendChild(tempPath);
+            
             const onMouseMove = (ev) => { const c = document.getElementById('node-canvas').getBoundingClientRect(); const mX = ev.clientX - c.left, mY = ev.clientY - c.top; tempPath.setAttribute('d', `M ${x1} ${y1} C ${x1 + (dirA==='right'?50:-50)} ${y1}, ${mX + (dirA==='right'?-50:50)} ${mY}, ${mX} ${mY}`); };
+            
             const onMouseUp = (ev) => {
                 document.removeEventListener('mousemove', onMouseMove); document.removeEventListener('mouseup', onMouseUp); if (tempPath) tempPath.remove();
                 const targetPort = ev.target.closest('.node-port');
+                
                 if (targetPort && nodeIdA !== targetPort.dataset.node) {
-                    let fromId = nodeIdA, toId = targetPort.dataset.node; if (dirA === 'left') { fromId = toId; toId = nodeIdA; }
+                    const isSourceOut = dirA === 'right';
+                    const isTargetIn = targetPort.dataset.dir === 'left';
+
+                    let fromId = nodeIdA, toId = targetPort.dataset.node;
+                    let finalBranchIndex = undefined;
+
+                    // 连接方向正确性校验
+                    if (!isSourceOut && !isTargetIn) {
+                        return showToast("只能从【右侧出口】连到【左侧入口】");
+                    } else if (!isSourceOut && isTargetIn) {
+                        // 反向拉线，比如从左向右拉
+                        fromId = targetPort.dataset.node; 
+                        toId = nodeIdA;
+                        // 获取目标节点的分支索引
+                        finalBranchIndex = targetPort.dataset.branch !== undefined ? parseInt(targetPort.dataset.branch) : undefined;
+                    } else {
+                        // 正常正向拉线
+                        finalBranchIndex = branchIndex;
+                    }
+
                     const st = getStories().find(s => s.id === currentManageId), ch = st.chapters.find(c => c.id === currentChapterId);
+                    // 过滤旧连线
                     ch.edges = ch.edges.filter(edge => !(edge.from === fromId && edge.to === toId));
-                    ch.edges.push({ from: fromId, to: toId, branchIndex: (dirA === 'right') ? branchIndex : undefined });
+                    ch.edges.push({ from: fromId, to: toId, branchIndex: finalBranchIndex });
+                    
                     saveStories(getStories()); renderNodeEditor();
                 }
             };
@@ -682,12 +800,69 @@ function editNode(id) {
     });
 }
 
+// ================= 自动排版算法 =================
+function autoLayout() {
+    const st = getStories().find(s => s.id === currentManageId);
+    const ch = st.chapters.find(c => c.id === currentChapterId);
+    if (!ch || !ch.nodes || ch.nodes.length === 0) return;
+
+    const levels = {}; 
+    const visited = new Set();
+    const startNode = ch.nodes.find(n => n.type === 'start');
+    
+    const queue = [{ id: startNode ? startNode.id : null, level: 0 }];
+    while(queue.length > 0) {
+        const { id, level } = queue.shift();
+        if (!id || visited.has(id)) continue;
+        visited.add(id);
+        if (!levels[level]) levels[level] = [];
+        levels[level].push(id);
+
+        const outEdges = ch.edges.filter(e => e.from === id);
+        outEdges.forEach(e => {
+            if (!visited.has(e.to)) queue.push({ id: e.to, level: level + 1 });
+        });
+    }
+
+    ch.nodes.forEach(n => {
+        if (!visited.has(n.id)) {
+            const maxLvl = Object.keys(levels).length;
+            if (!levels[maxLvl]) levels[maxLvl] = [];
+            levels[maxLvl].push(n.id);
+        }
+    });
+
+    let maxNodesInLevel = 0;
+    Object.keys(levels).forEach(lvl => {
+        maxNodesInLevel = Math.max(maxNodesInLevel, levels[lvl].length);
+    });
+
+    const startY = 150;
+    const gapY = 150;
+
+    Object.keys(levels).forEach(lvl => {
+        const nodesInLvl = levels[lvl];
+        const startOffsetY = startY + (maxNodesInLevel - nodesInLvl.length) * gapY / 2;
+        nodesInLvl.forEach((nodeId, index) => {
+            const node = ch.nodes.find(n => n.id === nodeId);
+            if (node) {
+                node.x = 100 + lvl * 320;
+                node.y = startOffsetY + index * gapY;
+            }
+        });
+    });
+
+    saveStories(getStories());
+    renderNodeEditor();
+    showToast("✨ 排版完成");
+}
+
 function openAddChapterModal() { openModal("新章节", `<input type="text" id="m-ch-title" placeholder="标题">`, () => { const t = document.getElementById('m-ch-title').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); s.chapters.push({ id: 'ch_'+Date.now(), title: t, nodes: [], edges: [] }); saveStories(getStories()); renderManageSubPage('chapters'); }); }
 function openAddCharacterModal() { openModal("新角色", `<input type="text" id="m-c-name" placeholder="名字"><textarea id="m-c-desc" rows="3" placeholder="简介" style="margin-top:10px;"></textarea>`, () => { const n = document.getElementById('m-c-name').value; if(!n) return; const s = getStories().find(x => x.id === currentManageId); s.characters.push({ id: 'char_'+Date.now(), name: n, desc: document.getElementById('m-c-desc').value }); saveStories(getStories()); renderManageSubPage('characters'); }); }
 function openAddPlotModal() { openModal("新地点", `<input type="text" id="m-p-title" placeholder="名称"><textarea id="m-p-desc" rows="3" placeholder="描述" style="margin-top:10px;"></textarea>`, () => { const t = document.getElementById('m-p-title').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); s.plots.push({ id: 'plot_'+Date.now(), title: t, desc: document.getElementById('m-p-desc').value, x: 50, y: 50 }); saveStories(getStories()); renderManageSubPage('plots'); }); }
 function openAddWikiModal() { openModal("新词条", `<input type="text" id="m-w-term" placeholder="词条名"><textarea id="m-w-content" rows="3" placeholder="内容" style="margin-top:10px;"></textarea><select id="m-w-unlock" style="margin-top:10px;width:100%;padding:5px;"><option value="">所有人可见</option>${getStories().find(x=>x.id===currentManageId).chapters.map(c=>`<option value="${c.id}">读完 ${c.title} 解锁</option>`).join('')}</select>`, () => { const t = document.getElementById('m-w-term').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); s.wiki.push({ id: 'wiki_'+Date.now(), term: t, content: document.getElementById('m-w-content').value, unlockChapter: document.getElementById('m-w-unlock').value }); saveStories(getStories()); renderManageSubPage('wiki'); }); }
 function openAddRelationshipModal() { const s = getStories().find(x=>x.id===currentManageId); if(!s.characters || s.characters.length < 2) return showToast("需要至少2个角色"); const opts = s.characters.map(c=>`<option value="${c.name}">${c.name}</option>`).join(''); openModal("添加关系", `<div class="form-group"><label>A</label><select id="m-rel-from">${opts}</select></div><div class="form-group"><label>B</label><select id="m-rel-to">${opts}</select></div><div class="form-group"><label>标签</label><input type="text" id="m-rel-label"></div>`, () => { const f = document.getElementById('m-rel-from').value, t = document.getElementById('m-rel-to').value, l = document.getElementById('m-rel-label').value; if(f===t || !l) return; s.relationships = s.relationships.filter(r => !(r.from === f && r.to === t) && !(r.from === t && r.to === f)); s.relationships.push({ from: f, to: t, label: l }); saveStories(getStories()); switchCharTab('graph'); }); }
-function saveStoryInfo() { const s = getStories().find(x => x.id === currentManageId); s.title = document.getElementById('edit-title').value; s.author = document.getElementById('edit-author').value; s.intro = document.getElementById('edit-intro').value; s.tags = document.getElementById('edit-tags').value.split(/[，,]/); s.cover = document.getElementById('edit-cover').value; saveStories(getStories()); showToast("已保存"); setTimeout(()=>{location.hash=`#manage/${s.id}`}, 500); }
+function saveStoryInfo() { const s = getStories().find(x => x.id === currentManageId); if(!s) return; s.title = document.getElementById('edit-title').value; s.intro = document.getElementById('edit-intro').value; s.tags = document.getElementById('edit-tags').value.split(/[，,]/); s.cover = document.getElementById('edit-cover').value; saveStories(getStories()); showToast("已保存"); setTimeout(()=>{location.hash=`#manage/${s.id}`}, 500); }
 function switchCharTab(t) { document.getElementById('tab-char-list').classList.toggle('active', t==='list'); document.getElementById('tab-char-graph').classList.toggle('active', t==='graph'); document.getElementById('char-content-list').style.display = t==='list'?'flex':'none'; document.getElementById('char-content-graph').style.display = t==='graph'?'block':'none'; if(t==='graph') renderRelationshipGraph(); }
 
 function renderRelationshipGraph() {
@@ -713,6 +888,7 @@ function startPlayer(sid, cid) {
     document.getElementById('bgm-player').pause(); hist = []; updateHist(); isAuto = false; isSkip = false; clearTimeout(autoT); clearTimeout(skipT); document.getElementById('btn-auto').style.color = '#fff'; document.getElementById('btn-skip').style.color = '#fff';
     const st = (playChap.nodes || []).find(n => n.type === 'start'); if (st) { currNodeId = st.id; processNode(); } else { showToast("无开始节点"); location.hash = `#detail/${sid}`; }
 }
+
 function processNode() {
     clearTimeout(autoT); clearTimeout(skipT);
     const n = (playChap.nodes || []).find(x => x.id === currNodeId);
@@ -722,7 +898,18 @@ function processNode() {
     if (n.type === 'bgm') { const a = document.getElementById('bgm-player'); if(n.bgm) { a.src = n.bgm; a.play().catch(()=>{}); } else { a.pause(); a.src = ''; } nextNode(); return; }
     if (n.type === 'illustration') { document.getElementById('bg-layer').style.backgroundImage = `url('${n.img}')`; nextNode(); return; }
     if (n.type === 'figure') { const f = document.getElementById('figure-layer'); if(n.img) { f.src = n.img; f.style.display = 'block'; } else { f.style.display = 'none'; } nextNode(); return; }
-    if (n.type === 'branch') { const ed = (playChap.edges || []).filter(x => x.from === currNodeId); if (ed.length > 0) showChoices(ed); else nextNode(); return; }
+    
+    if (n.type === 'branch') { 
+        const ed = (playChap.edges || []).filter(x => x.from === currNodeId); 
+        if (ed.length > 0) { showChoices(ed); } 
+        else { 
+            document.getElementById('textbox-container').style.display = 'block';
+            document.getElementById('char-name').style.display = 'none';
+            document.getElementById('dialogue-text').innerText = "【剧情缺失：当前分支节点未连线】";
+            document.getElementById('next-indicator').style.display = 'block';
+        }
+        return; 
+    }
     
     if (n.type === 'dialogue' || n.type === 'narration') {
         document.getElementById('textbox-container').style.display = 'block';
@@ -734,6 +921,7 @@ function processNode() {
         if (isSkip) { document.getElementById('dialogue-text').innerText = txt; isTyping = false; document.getElementById('next-indicator').style.display = 'block'; skipT = setTimeout(nextNode, 100); } else typeText();
     }
 }
+
 function typeText() { if (chIdx < txt.length) { document.getElementById('dialogue-text').innerText += txt.charAt(chIdx); chIdx++; typeTimer = setTimeout(typeText, isSkip ? 10 : 30); } else { isTyping = false; document.getElementById('next-indicator').style.display = 'block'; if (isAuto) autoT = setTimeout(nextNode, 1500); if (isSkip) skipT = setTimeout(nextNode, 100); } }
 function nextLine() { if (isTyping) { clearTimeout(typeTimer); document.getElementById('dialogue-text').innerText = txt; isTyping = false; document.getElementById('next-indicator').style.display = 'block'; if (isAuto) autoT = setTimeout(nextNode, 1500); if (isSkip) skipT = setTimeout(nextNode, 100); } else { nextNode(); } }
 document.getElementById('textbox-container').onclick = nextLine;
@@ -744,7 +932,27 @@ document.addEventListener('click', e => { const p = document.getElementById('his
 function updateHist() { const l = document.getElementById('history-list'); l.innerHTML = hist.map(h => `<div style="margin-bottom:10px;"><div style="color:#888;font-size:0.9em;">${h.name}</div><div style="color:#ddd;">${h.text}</div></div>`).join(''); l.scrollTop = l.scrollHeight; }
 function toggleHistory() { document.getElementById('history-panel').classList.toggle('open'); }
 function showChoices(eds) { document.getElementById('textbox-container').style.display = 'none'; const c = document.getElementById('choices-container'); c.innerHTML = ''; const bn = playChap.nodes.find(x => x.id === currNodeId); eds.forEach((ed, i) => { const btn = document.createElement('button'); btn.className = 'choice-btn'; btn.innerText = (bn && bn.options && ed.branchIndex !== undefined && bn.options[ed.branchIndex]) ? bn.options[ed.branchIndex].text : `选项 ${i+1}`; btn.onclick = () => { c.style.display = 'none'; currNodeId = ed.to; processNode(); }; c.appendChild(btn); }); c.style.display = 'flex'; }
-function nextNode() { clearTimeout(autoT); clearTimeout(skipT); const ed = (playChap.edges || []).find(e => e.from === currNodeId); if (ed) { currNodeId = ed.to; processNode(); } else showChapterEnd(""); }
+
+function nextNode() { 
+    clearTimeout(autoT); clearTimeout(skipT); 
+    const ed = (playChap.edges || []).find(e => e.from === currNodeId); 
+    if (ed) { 
+        currNodeId = ed.to; processNode(); 
+    } else {
+        const n = playChap.nodes.find(x => x.id === currNodeId);
+        if (n && n.type !== 'end') {
+            // 容错处理：如果节点没有连线，不要直接结束，给出提示
+            document.getElementById('textbox-container').style.display = 'block';
+            document.getElementById('char-name').style.display = 'none';
+            document.getElementById('dialogue-text').innerText = "【剧情断裂：作者尚未连接后续节点，点击退出】";
+            document.getElementById('next-indicator').style.display = 'none';
+            document.getElementById('textbox-container').onclick = exitPlayer;
+        } else {
+            showChapterEnd(""); 
+        }
+    }
+}
+
 function showChapterEnd(t) { document.getElementById('textbox-container').style.display = 'none'; const ov = document.getElementById('chapter-end-overlay'), c = document.getElementById('end-content-area'); 
     if (playChap) { let rh = []; try { rh = JSON.parse(safeGetLocal('vn_read_history') || '[]'); } catch(e){} if (!rh.includes(playChap.id)) { rh.push(playChap.id); safeSetLocal('vn_read_history', JSON.stringify(rh)); } }
     c.innerHTML = t && t.trim() ? `<h3 style="color:#c0a062; margin-bottom:15px;">结局</h3><p>${t}</p>` : `<h3 style="color:#c0a062; margin-bottom:15px;">本章已看完</h3>`; ov.classList.add('active');
@@ -754,7 +962,12 @@ function showChapterEnd(t) { document.getElementById('textbox-container').style.
 function goNextChapter() { const s = getStories().find(x => x.id === playStoryId), ci = s.chapters.findIndex(x => x.id === playChap.id); if (ci >= 0 && ci < s.chapters.length - 1) { document.getElementById('chapter-end-overlay').classList.remove('active'); location.hash = `#play/${s.id}/${s.chapters[ci+1].id}`; } }
 function goHomeFromEnd() { document.getElementById('chapter-end-overlay').classList.remove('active'); document.getElementById('bgm-player').pause(); location.hash = '#workspace'; }
 function goBackFromEnd() { document.getElementById('chapter-end-overlay').classList.remove('active'); document.getElementById('bgm-player').pause(); location.hash = `#detail/${playStoryId}`; }
-function exitPlayer() { clearTimeout(autoT); clearTimeout(skipT); document.getElementById('bgm-player').pause(); location.hash = `#detail/${playStoryId}`; }
+function exitPlayer() { 
+    clearTimeout(autoT); clearTimeout(skipT); 
+    document.getElementById('bgm-player').pause(); 
+    document.getElementById('textbox-container').onclick = nextLine; // 恢复点击事件
+    location.hash = `#detail/${playStoryId}`; 
+}
 
 // ================= 地图编辑器 =================
 let isDrawing = false, brushColor = '#2E8B57';
@@ -783,8 +996,14 @@ function drawCell(c, i) { c.style.backgroundColor = brushColor; const s = getSto
 function openCreateStoryModal() {
     openModal("创建新小说", `<div class="form-group"><label>标题</label><input type="text" id="m-title" value=""></div>`, () => {
         const title = document.getElementById('m-title').value; if(!title) return showToast("请输入标题");
+        let authorName = '', authorAvatar = DEFAULT_AVATAR;
+        if (currentUser) {
+            const p = globalProfilesCache[currentUser.id];
+            authorName   = (p && p.username)   ? p.username   : (safeGetLocal('user_name_'   + currentUser.id) || '未命名用户');
+            authorAvatar = (p && p.avatar_url) ? p.avatar_url : (safeGetLocal('user_avatar_' + currentUser.id) || DEFAULT_AVATAR);
+        }
         const stories = getStories();
-        stories.push({ id: 'story_' + Date.now(), title, author: '', author_avatar: DEFAULT_AVATAR, intro: '', status: 'private', cover: '', tags: [], chapters: [], characters: [], plots: [], wiki: [], relationships: [], mapGrid: new Array(1600).fill('transparent'), is_draft: true });
+        stories.push({ id: 'story_' + Date.now(), title, author: authorName, author_avatar: authorAvatar, intro: '', status: 'private', cover: '', tags: [], chapters: [], characters: [], plots: [], wiki: [], relationships: [], mapGrid: new Array(1600).fill('transparent'), is_draft: true });
         saveStories(stories); renderWorkspace(); 
     });
 }
