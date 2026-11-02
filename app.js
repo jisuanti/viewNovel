@@ -214,8 +214,8 @@ async function saveProfile() {
             document.getElementById('profile-overlay').classList.remove('active');
         } catch (e) {
             console.error("保存资料失败:", e);
-            showToast("❌ 保存失败：" + (e.message || '网络连接失败'));
-            return; // 保存失败就不关弹窗，让用户知道没存上
+            showToast("❌ 保存失败：" + (e.message || '请检查网络或数据库权限'));
+            return; 
         }
     }
 
@@ -339,7 +339,6 @@ async function uploadToCloud(storyId) {
     if (!currentUser || !supabaseClient) return showToast("请登录");
     const story = localStoriesCache.find(s => s.id === storyId); if (!story) return;
 
-    // 检查数据大小，防止全是 Base64 图片导致请求失败
     const dataSize = new Blob([JSON.stringify(story)]).size;
     if (dataSize > 4 * 1024 * 1024) {
         return showToast("❌ 作品数据过大(超过4MB)，请减少节点里的本地图片或BGM！");
@@ -517,26 +516,26 @@ function deleteStory() {
     showConfirm("删除小说", "确定要删除这本小说吗？删除后无法恢复。", async () => {
         const story = getStories().find(s => s.id === currentManageId);
         if (!story) return;
-        if (story.user_id) {
-            if (!currentUser) { showToast("请先登录后再删除云端作品"); return; }
-            if (story.user_id !== currentUser.id) { showToast("只能删除自己的作品"); return; }
-            if (supabaseClient) {
-                showToast("云端删除中...");
-                try {
-                    const { error } = await supabaseClient.from('stories').delete().eq('id', story.id);
-                    if (error) throw error;
-                } catch (e) {
-                    console.error("cloud delete failed:", e);
-                    showToast("云端删除失败：" + (e.message || e) + "（本地保留）");
-                    return; 
-                }
+
+        // 只要连了云端，不管三七二十一，先强删云端
+        if (supabaseClient) {
+            showToast("正在清理云端数据...");
+            try {
+                const { error } = await supabaseClient.from('stories').delete().eq('id', story.id);
+                if (error) throw error;
+            } catch (e) {
+                console.error("cloud delete failed:", e);
+                showToast("云端删除失败：" + (e.message || '请检查 Supabase 的 DELETE 权限') + "（本地已保留）");
+                return; // 云端删不掉，就不删本地，防止掩盖问题
             }
         }
+
+        // 云端清理干净了，再清理本地浏览器
         const stories = getStories();
         const newStories = stories.filter(s => s.id !== story.id);
         saveStories(newStories);
         location.hash = '#workspace';
-        showToast("已删除");
+        showToast("已彻底删除");
     });
 }
 
@@ -683,15 +682,15 @@ async function addSprite() {
             showToast("上传中...");
             try {
                 // 过滤掉中文及不支持的字符，只保留英文字母、数字、下划线、点、横杠
-const rawName = file.name;
-const ext = rawName.substring(rawName.lastIndexOf('.'));
-const baseName = rawName.substring(0, rawName.lastIndexOf('.'));
-const safeBase = baseName.replace(/[^a-zA-Z0-9_\-]/g, '_');
-const safeFileName = safeBase + ext;
+                const rawName = file.name;
+                const ext = rawName.substring(rawName.lastIndexOf('.'));
+                const baseName = rawName.substring(0, rawName.lastIndexOf('.'));
+                const safeBase = baseName.replace(/[^a-zA-Z0-9_\-]/g, '_');
+                const safeFileName = safeBase + ext;
 
-const { data, error } = await supabaseClient.storage
-    .from('audio')
-    .upload(`sprite_${Date.now()}_${safeFileName}`, file);
+                const { data, error } = await supabaseClient.storage
+                    .from('audio')
+                    .upload(`sprite_${Date.now()}_${safeFileName}`, file);
                 if (error) throw error;
                 url = supabaseClient.storage.from('audio').getPublicUrl(data.path).data.publicUrl;
                 showToast("立绘上传成功");
@@ -1020,7 +1019,7 @@ function addBranchOptInput(text = '', reqVars = '') {
     const div = document.createElement('div');
     div.className = 'branch-opt-row';
     div.style.cssText = "display:flex; gap:5px; margin-bottom:8px; align-items:center;";
-        div.innerHTML = `
+    div.innerHTML = `
         <input type="text" class="opt-text" value="${text}" placeholder="选项文字(例如: 拿出钥匙)" style="flex:2; padding:8px; border-radius:5px; border:1px solid #ccc;">
         <input type="text" class="opt-req" value="${reqVars}" placeholder="要求拥有道具(可选)" style="flex:2; padding:8px; border-radius:5px; border:1px solid #ccc;">
         <button class="glass-btn" style="padding:6px 10px; color:#d9534f !important; border-color:#d9534f;" onclick="this.parentNode.remove()">删除</button>
@@ -1038,7 +1037,7 @@ function editNode(id) {
         if (node.type === 'dialogue' || node.type === 'narration') html += `<div class="form-group"><label>内容</label><textarea id="e-node-text" rows="3">${node.text||''}</textarea></div>`;
         if (node.type === 'end') html = `<div class="form-group"><label>结局</label><textarea id="e-node-text" rows="4">${node.text||''}</textarea></div>`;
         
-                html += `
+        html += `
             <div class="form-group">
                 <label style="color:#52c41a;">解锁道具/剧情条件（可选，多个用英文逗号隔开）</label>
                 <input type="text" id="e-node-setvars" value="${node.setVars||''}" placeholder="例如：获得钥匙, 遇到魔女">
@@ -1077,7 +1076,7 @@ function editNode(id) {
             <div style="text-align:right;margin-top:10px;"><button class="text-btn" style="color:#d9534f;" onclick="document.getElementById('clear-bgm-flag').value='1'; showToast('点击确定后清空 BGM');">清空</button><input type="hidden" id="clear-bgm-flag" value="0"></div>
         `;
     }
-        else if (node.type === 'branch') {
+    else if (node.type === 'branch') {
         html = `
             <p style="color:#c0a062; font-size:0.85rem; margin-bottom:15px; line-height:1.5;">💡 提示：可以添加任意数量的选项。如果你要求玩家必须拥有某个道具，可以在右边填写对应的道具名（需与前面解锁的条件完全一致）。</p>
             <div id="branch-opt-list" style="margin-bottom:15px;"></div>
@@ -1140,7 +1139,13 @@ function editNode(id) {
                 if (supabaseClient && currentUser) {
                     showToast("上传中...");
                     try {
-                        const { data, error } = await supabaseClient.storage.from('audio').upload(`bgm_${Date.now()}_${file.name}`, file);
+                        const rawName = file.name;
+                        const ext = rawName.substring(rawName.lastIndexOf('.'));
+                        const baseName = rawName.substring(0, rawName.lastIndexOf('.'));
+                        const safeBase = baseName.replace(/[^a-zA-Z0-9_\-]/g, '_');
+                        const safeFileName = safeBase + ext;
+
+                        const { data, error } = await supabaseClient.storage.from('audio').upload(`bgm_${Date.now()}_${safeFileName}`, file);
                         if (error) throw error;
                         n.bgm = supabaseClient.storage.from('audio').getPublicUrl(data.path).data.publicUrl;
                         showToast("✅ BGM 上传成功");
