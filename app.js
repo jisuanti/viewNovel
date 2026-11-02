@@ -208,13 +208,18 @@ async function saveProfile() {
             const { error } = await supabaseClient.from('profiles').upsert({
                 id: currentUser.id, username: newName, avatar_url: newAvatar, bio: newBio, updated_at: new Date().toISOString()
             });
-            if (!error) globalProfilesCache[currentUser.id] = { username: newName, avatar_url: newAvatar, bio: newBio };
-        } catch (e) {}
+            if (error) throw error;
+            globalProfilesCache[currentUser.id] = { username: newName, avatar_url: newAvatar, bio: newBio };
+            showToast("资料已保存");
+            document.getElementById('profile-overlay').classList.remove('active');
+        } catch (e) {
+            console.error("保存资料失败:", e);
+            showToast("❌ 保存失败：" + (e.message || '网络连接失败'));
+            return; // 保存失败就不关弹窗，让用户知道没存上
+        }
     }
 
     updateAuthUI();
-    document.getElementById('profile-overlay').classList.remove('active');
-    showToast("资料已保存");
     if (window.location.hash.startsWith('#profile/')) renderProfilePage();
 }
 
@@ -334,6 +339,12 @@ async function uploadToCloud(storyId) {
     if (!currentUser || !supabaseClient) return showToast("请登录");
     const story = localStoriesCache.find(s => s.id === storyId); if (!story) return;
 
+    // 检查数据大小，防止全是 Base64 图片导致请求失败
+    const dataSize = new Blob([JSON.stringify(story)]).size;
+    if (dataSize > 4 * 1024 * 1024) {
+        return showToast("❌ 作品数据过大(超过4MB)，请减少节点里的本地图片或BGM！");
+    }
+
     const p = globalProfilesCache[currentUser.id];
     story.author        = (p && p.username)   ? p.username   : (safeGetLocal('user_name_'   + currentUser.id) || '未命名用户');
     story.author_avatar = (p && p.avatar_url) ? p.avatar_url : (safeGetLocal('user_avatar_' + currentUser.id) || DEFAULT_AVATAR);
@@ -348,8 +359,19 @@ async function uploadToCloud(storyId) {
         }, { onConflict: 'id' });
         if (error) throw error;
         story.is_draft = false;
-        safeSetLocal('vn_stories', JSON.stringify(localStoriesCache)); renderWorkspace(); showToast("已发布到云端");
-    } catch(e) { showToast("失败：" + e.message); }
+        safeSetLocal('vn_stories', JSON.stringify(localStoriesCache)); 
+        renderWorkspace(); 
+        showToast("已发布到云端");
+    } catch(e) { 
+        console.error(e);
+        if (e.message.includes('Failed to fetch')) {
+            showToast("❌ 网络连接失败！请检查网络或开启代理");
+        } else if (e.message.includes('row-level security')) {
+            showToast("❌ 权限不足：请在Supabase允许修改stories表");
+        } else {
+            showToast("❌ 上传失败：" + e.message); 
+        }
+    }
 }
 
 // ================= 路由与核心 =================
@@ -660,9 +682,16 @@ async function addSprite() {
         if (supabaseClient && currentUser) {
             showToast("上传中...");
             try {
-                const { data, error } = await supabaseClient.storage
-                    .from('audio')
-                    .upload(`sprite_${Date.now()}_${file.name}`, file);
+                // 过滤掉中文及不支持的字符，只保留英文字母、数字、下划线、点、横杠
+const rawName = file.name;
+const ext = rawName.substring(rawName.lastIndexOf('.'));
+const baseName = rawName.substring(0, rawName.lastIndexOf('.'));
+const safeBase = baseName.replace(/[^a-zA-Z0-9_\-]/g, '_');
+const safeFileName = safeBase + ext;
+
+const { data, error } = await supabaseClient.storage
+    .from('audio')
+    .upload(`sprite_${Date.now()}_${safeFileName}`, file);
                 if (error) throw error;
                 url = supabaseClient.storage.from('audio').getPublicUrl(data.path).data.publicUrl;
                 showToast("立绘上传成功");
@@ -828,11 +857,11 @@ function renderNodeEditor() {
 
     chapter.nodes.forEach(node => {
         if (!node || !node.type) return;
-        if (node.type === 'branch' && (!node.options || node.options.length < 2)) { node.options = [{ text: '选项A' }, { text: '选项B' }]; }
+        if (node.type === 'branch' && (!node.options || node.options.length === 0)) { node.options = [{ text: '选项A' }, { text: '选项B' }]; }
 
         let content = '';
-        if (node.type === 'dialogue') content = `<b>${node.name || '角色'}</b>: ${node.text || '...'}`;
-        else if (node.type === 'narration') content = `<span style="color:#888;">旁白:</span> ${node.text || '...'}`;
+        if (node.type === 'dialogue') content = `<b>${node.name || '角色'}</b>: ${node.text || '...'}${node.setVars ? `<br><span style="color:#52c41a;font-size:0.75rem;">[获得标记: ${node.setVars}]</span>` : ''}`;
+        else if (node.type === 'narration') content = `<span style="color:#888;">旁白:</span> ${node.text || '...'}${node.setVars ? `<br><span style="color:#52c41a;font-size:0.75rem;">[获得标记: ${node.setVars}]</span>` : ''}`;
         else if (node.type === 'figure') {
             let action = node.action || (node.hide ? 'hide' : 'show');
             let pos = node.pos || (node.hide ? 'all' : 'center');
@@ -841,7 +870,11 @@ function renderNodeEditor() {
         }
         else if (node.type === 'bgm') content = node.bgm ? (node.bgm.startsWith('http') ? `🔗 BGM: 云端` : `🎵 BGM: 本地`) : `🔇 BGM: 停止`;
         else if (node.type === 'illustration') content = `🖼️ 背景: ${node.hide ? '清空' : (node.img ? '已设置' : '未设置')}`;
-        else if (node.type === 'branch') content = `<div style="color:#c0a062; font-weight:bold;">🔀 分支：</div><div style="font-size:0.8rem; margin-top:5px;">A: ${node.options[0].text}<br>B: ${node.options[1].text}</div>`;
+        else if (node.type === 'branch') {
+            content = `<div style="color:#c0a062; font-weight:bold;">🔀 分支 (${node.options.length}项)：</div><div style="font-size:0.8rem; margin-top:5px;">`;
+            node.options.forEach((opt, i) => { content += `${String.fromCharCode(65+i)}: ${opt.text} ${opt.reqVars ? '🔒' : ''}<br>`; });
+            content += `</div>`;
+        }
         else if (node.type === 'end') content = `🛑 结局: ${node.text ? node.text.substring(0, 10) + '...' : '未命名'}`;
         else content = '开始';
 
@@ -851,7 +884,7 @@ function renderNodeEditor() {
 
         if (node.type !== 'start' && ins.length === 0) errs.push('缺少入口连线');
         if (node.type !== 'end' && outs.length === 0) errs.push('缺少出口连线');
-        if (node.type === 'branch' && outs.length < 2) errs.push('分支未连满2条线');
+        if (node.type === 'branch' && outs.length < node.options.length) errs.push(`分支有${node.options.length}项，但只连了${outs.length}条线`);
         if (node.type === 'end' && outs.length > 0) errs.push('结局节点不应有出口');
 
         if (errs.length > 0) totalErrors++;
@@ -864,7 +897,17 @@ function renderNodeEditor() {
         }
 
         let inPort = node.type !== 'start' ? `<div class="node-port port-in port-left" data-node="${node.id}" data-dir="left"></div>` : '';
-        let outPort = node.type === 'branch' ? `<div class="node-port port-out port-out-branch-1" data-node="${node.id}" data-branch="0" data-dir="right"></div><div class="node-port port-out port-out-branch-2" data-node="${node.id}" data-branch="1" data-dir="right"></div>` : (node.type !== 'end' ? `<div class="node-port port-out port-right" data-node="${node.id}" data-dir="right"></div>` : '');
+        
+        let outPort = '';
+        if (node.type === 'branch') {
+            const outCount = node.options.length;
+            for (let i = 0; i < outCount; i++) {
+                const topPct = (i + 1) / (outCount + 1) * 100;
+                outPort += `<div class="node-port port-out" style="right:-8px; top:${topPct}%; transform:translateY(-50%);" data-node="${node.id}" data-branch="${i}" data-dir="right"></div>`;
+            }
+        } else if (node.type !== 'end') {
+            outPort = `<div class="node-port port-out port-right" data-node="${node.id}" data-dir="right"></div>`;
+        }
 
         let errIcon = errs.length > 0 ? `<div style="position:absolute; top:-10px; right:-10px; background:#ff4d4f; color:#fff; border-radius:50%; width:20px; height:20px; display:flex; justify-content:center; align-items:center; font-size:14px; z-index:10; pointer-events: none; box-shadow:0 2px 5px rgba(0,0,0,0.3);" title="${errs.join('，')}">!</div>` : '';
 
@@ -898,8 +941,12 @@ function drawEdges(edges) {
         if (fromNode && toNode) {
             let x1 = fromNode.offsetLeft + fromNode.offsetWidth, y1 = fromNode.offsetTop + fromNode.offsetHeight / 2;
             let x2 = toNode.offsetLeft, y2 = toNode.offsetTop + toNode.offsetHeight / 2;
-            if (edge.branchIndex !== undefined) { const p = fromNode.querySelector(`.port-out-branch-${edge.branchIndex + 1}`); if(p) y1 = fromNode.offsetTop + p.offsetTop + 8; }
-            else { if (toNode.offsetLeft + toNode.offsetWidth < fromNode.offsetLeft) { x1 = fromNode.offsetLeft; x2 = toNode.offsetLeft + toNode.offsetWidth; } }
+            if (edge.branchIndex !== undefined) { 
+                const p = fromNode.querySelector(`.node-port[data-branch="${edge.branchIndex}"]`); 
+                if(p) y1 = fromNode.offsetTop + p.offsetTop + 8; 
+            } else { 
+                if (toNode.offsetLeft + toNode.offsetWidth < fromNode.offsetLeft) { x1 = fromNode.offsetLeft; x2 = toNode.offsetLeft + toNode.offsetWidth; } 
+            }
             const d = `M ${x1} ${y1} C ${x1 + 50} ${y1}, ${x2 - 50} ${y2}, ${x2} ${y2}`;
             const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
             const path = document.createElementNS('http://www.w3.org/2000/svg', 'path'); path.setAttribute('d', d); path.setAttribute('stroke', '#c0a062'); path.setAttribute('stroke-width', '3'); path.setAttribute('fill', 'none');
@@ -945,7 +992,7 @@ function bindPorts(chapter) {
                     }
 
                     const st = getStories().find(s => s.id === currentManageId), ch = st.chapters.find(c => c.id === currentChapterId);
-                    ch.edges = ch.edges.filter(edge => !(edge.from === fromId && edge.to === toId));
+                    ch.edges = ch.edges.filter(edge => !(edge.from === fromId && edge.to === toId && edge.branchIndex === finalBranchIndex));
                     ch.edges.push({ from: fromId, to: toId, branchIndex: finalBranchIndex });
 
                     saveStories(getStories()); renderNodeEditor();
@@ -960,76 +1007,58 @@ function addNode(type) {
     const st = getStories().find(s => s.id === currentManageId), ch = st.chapters.find(c => c.id === currentChapterId); if (!ch) return;
     if (!ch.nodes) ch.nodes = []; if (!ch.edges) ch.edges = [];
     const c = document.getElementById('node-canvas-container');
-    const newNode = { id: 'n_' + Date.now(), type, x: (c?c.scrollLeft:0)+(c?c.offsetWidth:800)/2-110, y: (c?c.scrollTop:0)+(c?c.offsetHeight:600)/2-50, text: '', name: '', bgm: '', img: '', pos: 'center', action: 'show' };
+    const newNode = { id: 'n_' + Date.now(), type, x: (c?c.scrollLeft:0)+(c?c.offsetWidth:800)/2-110, y: (c?c.scrollTop:0)+(c?c.offsetHeight:600)/2-50, text: '', name: '', bgm: '', img: '', pos: 'center', action: 'show', setVars: '' };
     if (type === 'branch') newNode.options = [{ text: '选项A' }, { text: '选项B' }];
     ch.nodes.push(newNode); saveStories(getStories()); renderNodeEditor();
 }
 function deleteNode(e, id) { e.stopPropagation(); showConfirm("删除", "确认删除节点？", () => { const st = getStories().find(s => s.id === currentManageId), ch = st.chapters.find(c => c.id === currentChapterId); ch.nodes = ch.nodes.filter(n => n.id !== id); ch.edges = ch.edges.filter(e => e.from !== id && e.to !== id); saveStories(getStories()); renderNodeEditor(); }); }
+
+// 动态添加分支选项
+function addBranchOptInput(text = '', reqVars = '') {
+    const container = document.getElementById('branch-opt-list');
+    if (!container) return;
+    const div = document.createElement('div');
+    div.className = 'branch-opt-row';
+    div.style.cssText = "display:flex; gap:5px; margin-bottom:8px; align-items:center;";
+        div.innerHTML = `
+        <input type="text" class="opt-text" value="${text}" placeholder="选项文字(例如: 拿出钥匙)" style="flex:2; padding:8px; border-radius:5px; border:1px solid #ccc;">
+        <input type="text" class="opt-req" value="${reqVars}" placeholder="要求拥有道具(可选)" style="flex:2; padding:8px; border-radius:5px; border:1px solid #ccc;">
+        <button class="glass-btn" style="padding:6px 10px; color:#d9534f !important; border-color:#d9534f;" onclick="this.parentNode.remove()">删除</button>
+    `;
+    container.appendChild(div);
+}
 
 function editNode(id) {
     const story = getStories().find(s => s.id === currentManageId), ch = story.chapters.find(c => c.id === currentChapterId), node = ch.nodes.find(n => n.id === id);
     if (!node || node.type === 'start') return showToast("此节点不可编辑");
     let html = '';
 
-    if (node.type === 'dialogue') html = `<div class="form-group"><label>角色</label><input type="text" id="e-node-name" value="${node.name||''}"></div><div class="form-group"><label>内容</label><textarea id="e-node-text" rows="3">${node.text||''}</textarea></div>`;
-    else if (node.type === 'narration') html = `<div class="form-group"><label>旁白</label><textarea id="e-node-text" rows="3">${node.text||''}</textarea></div>`;
-    else if (node.type === 'end') html = `<div class="form-group"><label>结局</label><textarea id="e-node-text" rows="4">${node.text||''}</textarea></div>`;
-
+    if (node.type === 'dialogue' || node.type === 'narration' || node.type === 'end') {
+        if (node.type === 'dialogue') html = `<div class="form-group"><label>角色</label><input type="text" id="e-node-name" value="${node.name||''}"></div>`;
+        if (node.type === 'dialogue' || node.type === 'narration') html += `<div class="form-group"><label>内容</label><textarea id="e-node-text" rows="3">${node.text||''}</textarea></div>`;
+        if (node.type === 'end') html = `<div class="form-group"><label>结局</label><textarea id="e-node-text" rows="4">${node.text||''}</textarea></div>`;
+        
+                html += `
+            <div class="form-group">
+                <label style="color:#52c41a;">解锁道具/剧情条件（可选，多个用英文逗号隔开）</label>
+                <input type="text" id="e-node-setvars" value="${node.setVars||''}" placeholder="例如：获得钥匙, 遇到魔女">
+                <p style="font-size:0.75rem; color:#888; margin-top:5px;">只要玩家经过了这里，就会自动获得这些道具或条件。用于后续分支判断。</p>
+            </div>
+        `;
+    }
     else if (node.type === 'figure') {
         let action = node.action || (node.hide ? 'hide' : 'show');
         let pos = node.pos || (node.hide ? 'all' : 'center');
-        
         const allSprites = [];
-        (story.characters || []).forEach(c => {
-            (c.sprites || []).forEach(sp => {
-                allSprites.push({ charName: c.name, spriteName: sp.name, url: sp.url });
-            });
-        });
-        const options = allSprites.length
-            ? allSprites.map(sp => {
-                const safeUrl = (sp.url || '').replace(/"/g, '&quot;');
-                const selected = sp.url === node.img ? 'selected' : '';
-                return `<option value="${safeUrl}" ${selected}>${sp.charName} - ${sp.spriteName}</option>`;
-            }).join('')
-            : '';
-            
+        (story.characters || []).forEach(c => { (c.sprites || []).forEach(sp => { allSprites.push({ charName: c.name, spriteName: sp.name, url: sp.url }); }); });
+        const options = allSprites.length ? allSprites.map(sp => { const safeUrl = (sp.url || '').replace(/"/g, '&quot;'); const selected = sp.url === node.img ? 'selected' : ''; return `<option value="${safeUrl}" ${selected}>${sp.charName} - ${sp.spriteName}</option>`; }).join('') : '';
         html = `
-            <p style="color:#c0a062; font-size:0.85rem; margin-bottom:15px; line-height:1.5;">
-                💡 提示：同屏多人只需添加多个“显示立绘”节点；<br>想让某人单独退场，选“隐藏立绘”并指定位置即可。
-            </p>
-            <div class="form-group">
-                <label>操作动作</label>
-                <select id="e-node-figure-action" style="width:100%; padding:8px; border-radius:5px; border:1px solid #ccc;" onchange="document.getElementById('e-node-figure-img-area').style.display = this.value === 'show' ? 'block' : 'none';">
-                    <option value="show" ${action === 'show' ? 'selected' : ''}>显示 / 更新立绘</option>
-                    <option value="hide" ${action === 'hide' ? 'selected' : ''}>隐藏 / 退场立绘</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>目标位置</label>
-                <select id="e-node-figure-pos" style="width:100%; padding:8px; border-radius:5px; border:1px solid #ccc;">
-                    <option value="center" ${pos === 'center' ? 'selected' : ''}>居中</option>
-                    <option value="left" ${pos === 'left' ? 'selected' : ''}>左侧</option>
-                    <option value="right" ${pos === 'right' ? 'selected' : ''}>右侧</option>
-                    <option value="all" ${pos === 'all' ? 'selected' : ''}>全部位置</option>
-                </select>
-            </div>
-            
+            <p style="color:#c0a062; font-size:0.85rem; margin-bottom:15px; line-height:1.5;">💡 提示：同屏多人只需添加多个“显示立绘”节点；想让某人单独退场，选“隐藏立绘”并指定位置即可。</p>
+            <div class="form-group"><label>操作动作</label><select id="e-node-figure-action" style="width:100%; padding:8px; border-radius:5px; border:1px solid #ccc;" onchange="document.getElementById('e-node-figure-img-area').style.display = this.value === 'show' ? 'block' : 'none';"><option value="show" ${action === 'show' ? 'selected' : ''}>显示 / 更新立绘</option><option value="hide" ${action === 'hide' ? 'selected' : ''}>隐藏 / 退场立绘</option></select></div>
+            <div class="form-group"><label>目标位置</label><select id="e-node-figure-pos" style="width:100%; padding:8px; border-radius:5px; border:1px solid #ccc;"><option value="center" ${pos === 'center' ? 'selected' : ''}>居中</option><option value="left" ${pos === 'left' ? 'selected' : ''}>左侧</option><option value="right" ${pos === 'right' ? 'selected' : ''}>右侧</option><option value="all" ${pos === 'all' ? 'selected' : ''}>全部位置</option></select></div>
             <div id="e-node-figure-img-area" style="display: ${action === 'show' ? 'block' : 'none'};">
-                <div class="form-group">
-                    <label>从角色立绘中选择</label>
-                    <select id="e-node-sprite-select" style="width:100%; padding:8px; border-radius:5px; border:1px solid #ccc;">
-                        <option value="">-- 不选择（手动填 URL）--</option>
-                        ${options}
-                    </select>
-                    ${allSprites.length ? '' : '<p style="color:#888;font-size:0.8rem;margin-top:5px;">还没有立绘，请先到「角色管理 → 立绘」中添加</p>'}
-                </div>
-                <div class="form-group">
-                    <label>或填写图片链接</label>
-                    <input type="text" id="e-node-img" value="${node.img||''}" oninput="const i=document.getElementById('preview-img'); i.src=this.value; i.style.display=this.value?'block':'none';">
-                    <div style="text-align:center;margin-top:10px;">
-                        <img id="preview-img" src="${node.img||''}" style="max-width:100%; max-height:150px; display:${node.img?'block':'none'}; margin:0 auto;">
-                    </div>
-                </div>
+                <div class="form-group"><label>从角色立绘中选择</label><select id="e-node-sprite-select" style="width:100%; padding:8px; border-radius:5px; border:1px solid #ccc;"><option value="">-- 不选择（手动填 URL）--</option>${options}</select>${allSprites.length ? '' : '<p style="color:#888;font-size:0.8rem;margin-top:5px;">还没有立绘，请先到「角色管理 → 立绘」中添加</p>'}</div>
+                <div class="form-group"><label>或填写图片链接</label><input type="text" id="e-node-img" value="${node.img||''}" oninput="const i=document.getElementById('preview-img'); i.src=this.value; i.style.display=this.value?'block':'none';"><div style="text-align:center;margin-top:10px;"><img id="preview-img" src="${node.img||''}" style="max-width:100%; max-height:150px; display:${node.img?'block':'none'}; margin:0 auto;"></div></div>
             </div>
         `;
     }
@@ -1048,7 +1077,13 @@ function editNode(id) {
             <div style="text-align:right;margin-top:10px;"><button class="text-btn" style="color:#d9534f;" onclick="document.getElementById('clear-bgm-flag').value='1'; showToast('点击确定后清空 BGM');">清空</button><input type="hidden" id="clear-bgm-flag" value="0"></div>
         `;
     }
-    else if (node.type === 'branch') html = `<div class="form-group"><label>A 选项</label><input type="text" id="e-branch-a" value="${node.options[0]?.text||''}"></div><div class="form-group"><label>B 选项</label><input type="text" id="e-branch-b" value="${node.options[1]?.text||''}"></div>`;
+        else if (node.type === 'branch') {
+        html = `
+            <p style="color:#c0a062; font-size:0.85rem; margin-bottom:15px; line-height:1.5;">💡 提示：可以添加任意数量的选项。如果你要求玩家必须拥有某个道具，可以在右边填写对应的道具名（需与前面解锁的条件完全一致）。</p>
+            <div id="branch-opt-list" style="margin-bottom:15px;"></div>
+            <button class="glass-btn" style="width:100%; border:1px dashed #c0a062; color:#c0a062 !important;" onclick="addBranchOptInput()">+ 添加新选项</button>
+        `;
+    }
     else return;
 
     openModal("编辑节点", html, async () => {
@@ -1058,9 +1093,11 @@ function editNode(id) {
         if (n.type === 'dialogue') {
             n.name = document.getElementById('e-node-name').value;
             n.text = document.getElementById('e-node-text').value;
+            n.setVars = document.getElementById('e-node-setvars').value.trim();
         }
         else if (n.type === 'narration' || n.type === 'end') {
             n.text = document.getElementById('e-node-text').value;
+            n.setVars = document.getElementById('e-node-setvars').value.trim();
         }
         else if (n.type === 'figure') {
             n.action = document.getElementById('e-node-figure-action').value;
@@ -1075,10 +1112,20 @@ function editNode(id) {
             if (!n.hide) n.img = document.getElementById('e-node-img').value;
         }
         else if (n.type === 'branch') {
-            n.options = [
-                { text: document.getElementById('e-branch-a').value },
-                { text: document.getElementById('e-branch-b').value }
-            ];
+            const rows = document.querySelectorAll('#branch-opt-list .branch-opt-row');
+            const newOpts = [];
+            rows.forEach(row => {
+                const t = row.querySelector('.opt-text').value.trim();
+                const r = row.querySelector('.opt-req').value.trim();
+                if (t) newOpts.push({ text: t, reqVars: r });
+            });
+            n.options = newOpts.length > 0 ? newOpts : [{ text: '选项A', reqVars: '' }];
+            
+            // 清理超出长度的连线
+            const st = getStories().find(s => s.id === currentManageId);
+            st.chapters.find(c => c.id === currentChapterId).edges = st.chapters.find(c => c.id === currentChapterId).edges.filter(e => {
+                return !(e.from === id && e.branchIndex !== undefined && e.branchIndex >= n.options.length);
+            });
         }
         else if (n.type === 'bgm') {
             const clearFlag = document.getElementById('clear-bgm-flag').value === '1';
@@ -1093,9 +1140,7 @@ function editNode(id) {
                 if (supabaseClient && currentUser) {
                     showToast("上传中...");
                     try {
-                        const { data, error } = await supabaseClient.storage
-                            .from('audio')
-                            .upload(`bgm_${Date.now()}_${file.name}`, file);
+                        const { data, error } = await supabaseClient.storage.from('audio').upload(`bgm_${Date.now()}_${file.name}`, file);
                         if (error) throw error;
                         n.bgm = supabaseClient.storage.from('audio').getPublicUrl(data.path).data.publicUrl;
                         showToast("✅ BGM 上传成功");
@@ -1106,15 +1151,9 @@ function editNode(id) {
                     }
                 } else {
                     const base64 = await new Promise((resolve, reject) => {
-                        const r = new FileReader();
-                        r.onload = ev => resolve(ev.target.result);
-                        r.onerror = reject;
-                        r.readAsDataURL(file);
+                        const r = new FileReader(); r.onload = ev => resolve(ev.target.result); r.onerror = reject; r.readAsDataURL(file);
                     });
-                    if (base64.length > 3 * 1024 * 1024) {
-                        showToast("文件过大（>3MB），请登录后上传或填写音频 URL");
-                        return false;
-                    }
+                    if (base64.length > 3 * 1024 * 1024) { showToast("文件过大（>3MB），请登录后上传或填写音频 URL"); return false; }
                     n.bgm = base64;
                     showToast("已使用本地 BGM（建议登录上传）");
                 }
@@ -1131,15 +1170,21 @@ function editNode(id) {
     if (node.type === 'figure') {
         setTimeout(() => {
             const sel = document.getElementById('e-node-sprite-select');
-            if (!sel) return;
-            sel.onchange = () => {
+            if (sel) sel.onchange = () => {
                 if (!sel.value) return;
                 const imgInput = document.getElementById('e-node-img');
                 const preview = document.getElementById('preview-img');
-                imgInput.value = sel.value;
-                preview.src = sel.value;
-                preview.style.display = 'block';
+                imgInput.value = sel.value; preview.src = sel.value; preview.style.display = 'block';
             };
+        }, 0);
+    }
+    if (node.type === 'branch') {
+        setTimeout(() => {
+            const list = document.getElementById('branch-opt-list');
+            if (list) {
+                list.innerHTML = '';
+                node.options.forEach(opt => addBranchOptInput(opt.text || '', opt.reqVars || ''));
+            }
         }, 0);
     }
 }
@@ -1181,11 +1226,8 @@ function autoLayout() {
         maxNodesInLevel = Math.max(maxNodesInLevel, levels[lvl].length);
     });
 
-    const startX = 100;
-    const gapX = 280; 
-    const startY = 100;
-    const gapY = 120; 
-
+    const startX = 100; const gapX = 280; 
+    const startY = 100; const gapY = 120; 
     let maxX = 0, maxY = 0;
 
     Object.keys(levels).forEach(lvl => {
@@ -1196,8 +1238,7 @@ function autoLayout() {
             if (node) {
                 node.x = startX + parseInt(lvl) * gapX;
                 node.y = startOffsetY + index * gapY;
-                maxX = Math.max(maxX, node.x);
-                maxY = Math.max(maxY, node.y);
+                maxX = Math.max(maxX, node.x); maxY = Math.max(maxY, node.y);
             }
         });
     });
@@ -1207,22 +1248,18 @@ function autoLayout() {
     if (canvas && svg) {
         let newW = Math.max(3000, maxX + 800); 
         let newH = Math.max(3000, maxY + 500); 
-        canvas.style.width = newW + 'px';
-        canvas.style.height = newH + 'px';
-        svg.setAttribute('width', newW);
-        svg.setAttribute('height', newH);
-        svg.style.width = newW + 'px';
-        svg.style.height = newH + 'px';
+        canvas.style.width = newW + 'px'; canvas.style.height = newH + 'px';
+        svg.setAttribute('width', newW); svg.setAttribute('height', newH);
+        svg.style.width = newW + 'px'; svg.style.height = newH + 'px';
     }
 
-    saveStories(getStories());
-    renderNodeEditor();
-    showToast("✨ 排版完成");
+    saveStories(getStories()); renderNodeEditor(); showToast("✨ 排版完成");
 }
 
 function openAddChapterModal() { openModal("新章节", `<input type="text" id="m-ch-title" placeholder="标题">`, () => { const t = document.getElementById('m-ch-title').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); s.chapters.push({ id: 'ch_'+Date.now(), title: t, nodes: [], edges: [] }); saveStories(getStories()); renderManageSubPage('chapters'); }); }
 function openAddCharacterModal() { openModal("新角色", `<input type="text" id="m-c-name" placeholder="名字"><textarea id="m-c-desc" rows="3" placeholder="简介" style="margin-top:10px;"></textarea>`, () => { const n = document.getElementById('m-c-name').value; if(!n) return; const s = getStories().find(x => x.id === currentManageId); s.characters.push({ id: 'char_'+Date.now(), name: n, desc: document.getElementById('m-c-desc').value, sprites: [] }); saveStories(getStories()); renderManageSubPage('characters'); }); }
 function openAddPlotModal() { openModal("新地点", `<input type="text" id="m-p-title" placeholder="名称"><textarea id="m-p-desc" rows="3" placeholder="描述" style="margin-top:10px;"></textarea>`, () => { const t = document.getElementById('m-p-title').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); s.plots.push({ id: 'plot_'+Date.now(), title: t, desc: document.getElementById('m-p-desc').value, x: 50, y: 50 }); saveStories(getStories()); renderManageSubPage('plots'); }); }
+
 function openAddWikiModal() { openModal("新词条", `<input type="text" id="m-w-term" placeholder="词条名"><textarea id="m-w-content" rows="3" placeholder="内容" style="margin-top:10px;"></textarea><select id="m-w-unlock" style="margin-top:10px;width:100%;padding:5px;"><option value="">所有人可见</option>${getStories().find(x=>x.id===currentManageId).chapters.map(c=>`<option value="${c.id}">读完 ${c.title} 解锁</option>`).join('')}</select>`, () => { const t = document.getElementById('m-w-term').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); s.wiki.push({ id: 'wiki_'+Date.now(), term: t, content: document.getElementById('m-w-content').value, unlockChapter: document.getElementById('m-w-unlock').value }); saveStories(getStories()); renderManageSubPage('wiki'); }); }
 function openAddRelationshipModal() { const s = getStories().find(x=>x.id===currentManageId); if(!s.characters || s.characters.length < 2) return showToast("需要至少2个角色"); const opts = s.characters.map(c=>`<option value="${c.name}">${c.name}</option>`).join(''); openModal("添加关系", `<div class="form-group"><label>A</label><select id="m-rel-from">${opts}</select></div><div class="form-group"><label>B</label><select id="m-rel-to">${opts}</select></div><div class="form-group"><label>标签</label><input type="text" id="m-rel-label"></div>`, () => { const f = document.getElementById('m-rel-from').value, t = document.getElementById('m-rel-to').value, l = document.getElementById('m-rel-label').value; if(f===t || !l) return; s.relationships = s.relationships.filter(r => !(r.from === f && r.to === t) && !(r.from === t && r.to === f)); s.relationships.push({ from: f, to: t, label: l }); saveStories(getStories()); switchCharTab('graph'); }); }
 function saveStoryInfo() { const s = getStories().find(x => x.id === currentManageId); if(!s) return; s.title = document.getElementById('edit-title').value; s.intro = document.getElementById('edit-intro').value; s.tags = document.getElementById('edit-tags').value.split(/[，,]/); s.cover = document.getElementById('edit-cover').value; saveStories(getStories()); showToast("已保存"); setTimeout(()=>{location.hash=`#manage/${s.id}`}, 500); }
@@ -1244,6 +1281,7 @@ function importData(e) { const f = e.target.files[0]; if(!f) return; const r = n
 
 // ================= 播放器核心 =================
 let currNodeId = null, isTyping = false, typeTimer = null, chIdx = 0, txt = "", hist = [], isAuto = false, isSkip = false, autoT = null, skipT = null, playStoryId = null, playChap = null;
+let currentVars = []; // 记录玩家当前拥有的标记
 
 function previewChapter() {
     if (!currentManageId || !currentChapterId) return;
@@ -1255,14 +1293,13 @@ function startPlayer(sid, cid) {
     playStoryId = sid; const s = getStories().find(x => x.id === sid); playChap = s.chapters.find(x => x.id === cid);
     document.getElementById('bg-layer').style.backgroundImage = s.bg ? `url('${s.bg}')` : 'none';
     
-    // 清空所有立绘位置
-    ['left', 'center', 'right'].forEach(pos => {
-        const f = document.getElementById('figure-layer-' + pos);
-        if (f) f.style.display = 'none';
-    });
+    ['left', 'center', 'right'].forEach(pos => { const f = document.getElementById('figure-layer-' + pos); if (f) f.style.display = 'none'; });
     
     document.getElementById('choices-container').style.display = 'none';
     document.getElementById('bgm-player').pause(); hist = []; updateHist(); isAuto = false; isSkip = false; clearTimeout(autoT); clearTimeout(skipT); document.getElementById('btn-auto').style.color = '#fff'; document.getElementById('btn-skip').style.color = '#fff';
+    
+    currentVars = []; // 重置变量
+    
     const st = (playChap.nodes || []).find(n => n.type === 'start'); if (st) { currNodeId = st.id; processNode(); } else { showToast("无开始节点"); location.hash = `#detail/${sid}`; }
 }
 
@@ -1272,15 +1309,17 @@ function processNode() {
     if (!n || n.type === 'end') { showChapterEnd(n ? n.text : ""); return; }
     if (n.type === 'start') { nextNode(); return; }
 
+    // 处理标记（获得变量）
+    if ((n.type === 'dialogue' || n.type === 'narration' || n.type === 'end') && n.setVars) {
+        let varsToAdd = n.setVars.split(',').map(s => s.trim()).filter(Boolean);
+        varsToAdd.forEach(v => { if (!currentVars.includes(v)) currentVars.push(v); });
+    }
+
     if (n.type === 'bgm') { const a = document.getElementById('bgm-player'); if(n.bgm) { a.src = n.bgm; a.play().catch(()=>{}); } else { a.pause(); a.src = ''; } nextNode(); return; }
     
     if (n.type === 'illustration') { 
         const bg = document.getElementById('bg-layer'); 
-        if (n.hide) {
-            bg.style.backgroundImage = 'none';
-        } else if (n.img) {
-            bg.style.backgroundImage = `url('${n.img}')`; 
-        }
+        if (n.hide) { bg.style.backgroundImage = 'none'; } else if (n.img) { bg.style.backgroundImage = `url('${n.img}')`; }
         nextNode(); return; 
     }
     
@@ -1288,7 +1327,6 @@ function processNode() {
         const fLeft = document.getElementById('figure-layer-left');
         const fCenter = document.getElementById('figure-layer-center');
         const fRight = document.getElementById('figure-layer-right');
-        
         let action = n.action || (n.hide ? 'hide' : 'show');
         let pos = n.pos || (n.hide ? 'all' : 'center');
 
@@ -1300,14 +1338,8 @@ function processNode() {
             let targetEl = fCenter;
             if (pos === 'left') targetEl = fLeft;
             if (pos === 'right') targetEl = fRight;
-            
             if (targetEl) {
-                if (n.img) {
-                    targetEl.src = n.img;
-                    targetEl.style.display = 'block';
-                } else {
-                    targetEl.style.display = 'none';
-                }
+                if (n.img) { targetEl.src = n.img; targetEl.style.display = 'block'; } else { targetEl.style.display = 'none'; }
             }
         }
         nextNode(); return; 
@@ -1315,7 +1347,7 @@ function processNode() {
 
     if (n.type === 'branch') {
         const ed = (playChap.edges || []).filter(x => x.from === currNodeId);
-        if (ed.length > 0) { showChoices(ed); }
+        if (ed.length > 0) { showChoices(ed, n); }
         else {
             document.getElementById('textbox-container').style.display = 'block';
             document.getElementById('char-name').style.display = 'none';
@@ -1345,7 +1377,44 @@ function toggleSkip() { isSkip = !isSkip; isAuto = false; document.getElementByI
 document.addEventListener('click', e => { const p = document.getElementById('history-panel'); if (p && p.classList.contains('open')) { if (!p.contains(e.target) && !e.target.closest('button[onclick="toggleHistory()"]')) p.classList.remove('open'); } });
 function updateHist() { const l = document.getElementById('history-list'); l.innerHTML = hist.map(h => `<div style="margin-bottom:10px;"><div style="color:#888;font-size:0.9em;">${h.name}</div><div style="color:#ddd;">${h.text}</div></div>`).join(''); l.scrollTop = l.scrollHeight; }
 function toggleHistory() { document.getElementById('history-panel').classList.toggle('open'); }
-function showChoices(eds) { document.getElementById('textbox-container').style.display = 'none'; const c = document.getElementById('choices-container'); c.innerHTML = ''; const bn = playChap.nodes.find(x => x.id === currNodeId); eds.forEach((ed, i) => { const btn = document.createElement('button'); btn.className = 'choice-btn'; btn.innerText = (bn && bn.options && ed.branchIndex !== undefined && bn.options[ed.branchIndex]) ? bn.options[ed.branchIndex].text : `选项 ${i+1}`; btn.onclick = () => { c.style.display = 'none'; currNodeId = ed.to; processNode(); }; c.appendChild(btn); }); c.style.display = 'flex'; }
+
+// 条件与多选项渲染
+function showChoices(eds, branchNode) { 
+    document.getElementById('textbox-container').style.display = 'none'; 
+    const c = document.getElementById('choices-container'); 
+    c.innerHTML = ''; 
+    
+    // 筛选满足条件的选项
+    const validEds = eds.filter(ed => {
+        if (ed.branchIndex === undefined) return true; // 没有索引的兜底连线
+        const opt = branchNode.options[ed.branchIndex];
+        if (!opt) return false;
+        if (opt.reqVars) {
+            let reqs = opt.reqVars.split(',').map(s => s.trim()).filter(Boolean);
+            return reqs.every(r => currentVars.includes(r));
+        }
+        return true;
+    });
+
+    if (validEds.length === 0) {
+        document.getElementById('textbox-container').style.display = 'block';
+        document.getElementById('char-name').style.display = 'none';
+        document.getElementById('dialogue-text').innerText = "【你似乎缺少了某些关键的线索，无法做出选择。请检查剧情变量或联系作者。】";
+        document.getElementById('next-indicator').style.display = 'none';
+        document.getElementById('textbox-container').onclick = exitPlayer;
+        return;
+    }
+
+    validEds.forEach((ed, i) => { 
+        const btn = document.createElement('button'); 
+        btn.className = 'choice-btn'; 
+        const optText = (branchNode && branchNode.options && ed.branchIndex !== undefined && branchNode.options[ed.branchIndex]) ? branchNode.options[ed.branchIndex].text : `选项 ${i+1}`;
+        btn.innerText = optText; 
+        btn.onclick = () => { c.style.display = 'none'; currNodeId = ed.to; processNode(); }; 
+        c.appendChild(btn); 
+    }); 
+    c.style.display = 'flex'; 
+}
 
 function nextNode() {
     clearTimeout(autoT); clearTimeout(skipT);
@@ -1379,15 +1448,9 @@ function showChapterEnd(t) {
     const nb = document.getElementById('btn-next-chapter');
 
     if (ci >= 0 && ci < s.chapters.length - 1) {
-        nb.style.display = 'block';
-        nb.disabled = false;
-        nb.style.opacity = '1';
-        nb.style.cursor = 'pointer';
+        nb.style.display = 'block'; nb.disabled = false; nb.style.opacity = '1'; nb.style.cursor = 'pointer';
     } else {
-        nb.style.display = 'block';
-        nb.disabled = true;
-        nb.style.opacity = '0.5';
-        nb.style.cursor = 'not-allowed';
+        nb.style.display = 'block'; nb.disabled = true; nb.style.opacity = '0.5'; nb.style.cursor = 'not-allowed';
     }
 }
 
@@ -1405,7 +1468,6 @@ function exitPlayer() {
     clearTimeout(autoT); clearTimeout(skipT);
     document.getElementById('bgm-player').pause();
     document.getElementById('textbox-container').onclick = nextLine;
-    
     if (window._isPreview) {
         window._isPreview = false;
         location.hash = `#manage/${playStoryId}/node-editor/${playChap.id}`;
