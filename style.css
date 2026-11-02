@@ -84,8 +84,9 @@ h1, h2, h3, p, span { margin: 0; padding: 0; }
 .tool-item { padding: 12px; background: #fcf9f2; border: 1px solid #ddd; border-radius: 8px; text-align: center; cursor: pointer; font-size: 0.9rem; user-select: none; transition: 0.2s; color: #333;}
 .tool-item:hover { background: #c0a062; color: #fff; border-color: #c0a062; }
 .node-canvas-container { flex: 1; position: relative; overflow: auto; background-image: radial-gradient(#ccc 1px, transparent 1px); background-size: 20px 20px; }
-.node-canvas { position: absolute; top: 0; left: 0; width: 3000px; height: 3000px; }
-#node-svg { position: absolute; top: 0; left: 0; width: 3000px; height: 3000px; pointer-events: none; z-index: 1; }
+/* 扩展画布和连线层的隐形边界 */
+.node-canvas { position: absolute; top: 0; left: 0; width: 20000px; height: 20000px; }
+#node-svg { position: absolute; top: 0; left: 0; width: 20000px; height: 20000px; pointer-events: none; z-index: 1; }
 .graph-node { position: absolute; background: #fff; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); border: 1px solid #ccc; width: 220px; user-select: none; z-index: 2; color: #333;}
 .graph-node-header { padding: 8px 12px; background: #f0f0f0; border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; font-size: 0.9rem; cursor: move; display: flex; justify-content: space-between; }
 .graph-node-body { padding: 12px; font-size: 0.85rem; cursor: pointer; }
@@ -171,9 +172,64 @@ h1, h2, h3, p, span { margin: 0; padding: 0; }
 .glass-toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
 
 /* 结局弹窗专属样式 */
-#chapter-end-overlay .glass-confirm-box { max-height: 80vh; display: flex; flex-direction: column; max-width: 500px; text-align: left; }
-#end-content-area { overflow-y: auto; padding-right: 5px; margin-bottom: 30px; }
-#end-content-area h3 { font-size: 1.5rem; color: #c0a062; margin-bottom: 15px; text-align: center; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 10px; }
-#end-content-area p { color: #ddd; line-height: 1.8; font-size: 1.05rem; white-space: pre-wrap; text-align: justify; }
+#chapter-end-overlay .glass-confirm-box {
+    max-width: 500px;
+    width: 90%;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    text-align: left;
+    overflow: hidden;
+}
+
+/* 内容区：flex 收缩 + 内部滚动 */
+#end-content-area {
+    flex: 1 1 auto;
+    min-height: 0;              /* 关键：允许 flex 子项收缩，触发滚动 */
+    overflow-y: auto;
+    padding-right: 8px;
+    margin-bottom: 20px;
+}
+#end-content-area h3 {
+    font-size: 1.5rem;
+    color: #c0a062;
+    margin-bottom: 15px;
+    text-align: center;
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+    padding-bottom: 10px;
+}
+#end-content-area p {
+    color: #ddd;
+    line-height: 1.8;
+    font-size: 1.05rem;
+    white-space: pre-wrap;
+    text-align: justify;
+}
 #end-content-area::-webkit-scrollbar { width: 6px; }
-#end-content-area::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
+#end-content-area::-webkit-scrollbar-track { background: transparent; }
+#end-content-area::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.25);
+    border-radius: 3px;
+}
+#end-content-area::-webkit-scrollbar-thumb:hover {
+    background: rgba(255,255,255,0.4);
+}
+
+/* 底部按钮区：强制不换行 + 三等分自适应 */
+#chapter-end-overlay .confirm-actions {
+    display: flex !important;
+    flex-wrap: nowrap !important;      /* 覆盖内联的 wrap */
+    justify-content: center !important;
+    align-items: stretch;
+    gap: 10px;
+    margin-top: 0 !important;
+    flex-shrink: 0;                    /* 按钮区固定在底部，不被压缩 */
+}
+#chapter-end-overlay .confirm-actions button {
+    flex: 1 1 0 !important;            /* 三等分 + 允许收缩 */
+    min-width: 0 !important;           /* 覆盖内联 min-width:100px，避免小屏溢出 */
+    padding: 10px 6px;
+    font-size: 0.88rem;
+    white-space: nowrap;
+    text-align: center;
+}

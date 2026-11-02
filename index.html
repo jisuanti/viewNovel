@@ -112,15 +112,19 @@
     </div>
 
     <!-- 5. 节点编辑器 -->
-    <div id="view-node-editor" class="view light-theme" style="display:none; padding:0; overflow:hidden;">
-        <header class="light-nav" style="position:absolute; top:60px; left:0; right:0; z-index:1000; background:rgba(252,249,242,0.95); backdrop-filter:blur(10px); border-bottom:1px solid #ddd; display:flex; align-items:center; gap:15px;">
+    <!-- 5. 节点编辑器 -->
+    <div id="view-node-editor" class="view light-theme" style="display:none; padding:0; overflow:hidden; display: flex; flex-direction: column; height: 100vh;">
+        <!-- 去掉了 absolute 定位，让它正常占位，不再遮挡画布 -->
+        <header class="light-nav" style="background:rgba(252,249,242,0.95); backdrop-filter:blur(10px); border-bottom:1px solid #ddd; display:flex; align-items:center; gap:15px; flex-shrink: 0; padding: 10px 20px; margin-top: 60px;">
             <button class="glass-btn" style="color:#666; border-color:#ccc;" onclick="location.hash = '#manage/' + currentManageId + '/chapters'">← 返回章节列表</button>
             <span id="node-editor-title" style="font-weight:bold; color:#333; font-size:1.1rem;"></span>
             <div style="flex:1;"></div>
+            <!-- 确保这里只有一个一键排版 -->
             <button class="glass-btn" style="background:#fcf9f2; color:#c0a062; border-color:#c0a062;" onclick="autoLayout()">✨ 一键排版(新手)</button>
+            <button class="btn-gold" style="padding: 8px 20px; margin-left: 10px;" onclick="previewChapter()">▶️ 预览本章</button>
         </header>
         
-        <div class="node-editor-layout" style="padding-top: 130px;">
+        <div class="node-editor-layout" style="flex:1; height: auto; padding-top: 0;">
             <div class="node-toolbar">
                 <div class="tool-item" onclick="addNode('dialogue')">🗨️ 对话</div>
                 <div class="tool-item" onclick="addNode('narration')">📖 旁白</div>
@@ -218,7 +222,8 @@
 
     <!-- 详情页 -->
     <div id="view-detail" class="view dark-theme">
-        <button class="glass-btn" style="position:absolute; top:80px; left:40px; z-index:100;" onclick="history.back()">← 返回</button>
+        <!-- ✅ 改动点：history.back() → goBackFromDetail() -->
+        <button class="glass-btn" style="position:absolute; top:80px; left:40px; z-index:100;" onclick="goBackFromDetail()">← 返回</button>
         <div class="detail-scroll-container" style="padding-top:40px;">
             <div class="detail-top-section">
                 <div class="cover-wrapper">
@@ -232,7 +237,7 @@
                     <button class="start-btn" id="btn-start">开始观看</button>
                 </div>
             </div>
-            
+
             <div class="detail-bottom-section">
                 <h3 style="margin-bottom:15px; font-weight:normal; color:#aaa;">📖 百科词条</h3>
                 <div id="detail-wiki-area" style="display:flex; flex-wrap:wrap; gap:15px;"></div>
@@ -253,7 +258,9 @@
     <!-- 播放器 -->
     <div id="view-player" class="view dark-theme">
         <div id="bg-layer"></div>
-        <img id="figure-layer" src="" style="position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); max-height: 90vh; max-width: 100vw; z-index: 3; display: none; object-fit: contain;">
+        <img id="figure-layer-left" src="" style="position: absolute; bottom: 0; left: 25%; transform: translateX(-50%); max-height: 90vh; z-index: 3; display: none; object-fit: contain;">
+        <img id="figure-layer-center" src="" style="position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); max-height: 90vh; z-index: 3; display: none; object-fit: contain;">
+        <img id="figure-layer-right" src="" style="position: absolute; bottom: 0; left: 75%; transform: translateX(-50%); max-height: 90vh; z-index: 3; display: none; object-fit: contain;">
         <div id="bg-overlay"></div>
         <div id="player-top-bar">
             <button class="glass-btn" onclick="exitPlayer()">← 退出剧情</button>
@@ -268,6 +275,19 @@
         </div>
         <div id="choices-container"></div>
         <div id="history-panel"><h3>历史记录</h3><div id="history-list"></div></div>
+
+        <!-- 结局弹窗 -->
+        <div id="chapter-end-overlay" class="modal-overlay" style="z-index: 10000;">
+            <div class="glass-confirm-box">
+                <div id="end-content-area"></div>
+                <div class="confirm-actions" style="margin-top: 20px; justify-content: center; flex-wrap: wrap;">
+                    <button class="glass-btn" onclick="goBackFromEnd()" style="min-width: 100px;">返回详情页</button>
+                    <button class="glass-btn" onclick="goHomeFromEnd()" style="min-width: 100px;">返回主界面</button>
+                    <button class="btn-gold" id="btn-next-chapter" onclick="goNextChapter()" style="min-width: 100px;">下一章</button>
+                </div>
+            </div>
+        </div>
+
         <audio id="bgm-player" loop></audio>
     </div>
 
@@ -320,7 +340,7 @@
     </div>
 
     <div id="toast" class="glass-toast"><span id="toast-text"></span></div>
-    
+
     <div id="confirm-overlay" class="modal-overlay">
         <div class="glass-confirm-box">
             <h3 id="confirm-title">提示</h3>
