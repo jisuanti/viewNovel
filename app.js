@@ -1818,7 +1818,8 @@ function editNode(id) {
         }, 0);
     }
 }
-// ================= 自动排版算法（新版） =================
+
+// ================= 自动排版算法 =================
 function autoLayout() {
     const st = getStories().find(s => s.id === currentManageId);
     if (!st) return;
