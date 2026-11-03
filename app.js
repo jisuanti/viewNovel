@@ -12,7 +12,7 @@ const IMG_HOST_HINT = 'https://img.remit.ee/image-to-url';
 let _dragging = false;
 let _linking = false;
 
-// ================= 工具与安全 =================
+// ================= 工具 =================
 function safeGetLocal(k){try{return localStorage.getItem(k)}catch(e){return null}}
 function safeSetLocal(k,v){try{localStorage.setItem(k,v)}catch(e){}}
 function safeBind(id,e,f){const el=document.getElementById(id);if(el)el[e]=f}
@@ -21,11 +21,15 @@ function splitConditions(str) {
     if (str == null) return [];
     return String(str).split(/[,，、;；]/).map(s => s.trim()).filter(Boolean);
 }
+function simpleHash(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) {
+        h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+    }
+    return h.toString(36);
+}
 
 // ================= 玩法状态（跨章伏笔核心） =================
-// vn_play_state: { [storyId]: { pendingEntry: '', vars: [] } }
-// vn_resume_points: { [storyId]: { chapterId, nodeId, vars, pendingEntry, timestamp, title, cover, chapterTitle } }
-
 function _loadStateMap() {
     try { return JSON.parse(localStorage.getItem('vn_play_state') || '{}') || {}; } catch(e) { return {}; }
 }
@@ -83,14 +87,26 @@ function formatTime(ts) {
     return `${d.getMonth()+1}月${d.getDate()}日`;
 }
 
-// 把当前进度写入断点
+// 保存进度快照（含背景/立绘/BGM）
 function saveReadProgress() {
+    if (window._isPreview) return;  // 预览不保存进度
     if (!playStoryId || !playChap || !currNodeId) return;
     const s = getStories().find(x => x.id === playStoryId);
     if (!s) return;
     const ps = loadPlayState(playStoryId);
     ps.vars = [...currentVars];
     savePlayState(playStoryId, ps);
+
+    const bgLayer = document.getElementById('bg-layer');
+    const bgImage = bgLayer ? (bgLayer.style.backgroundImage || '') : '';
+    const figures = {};
+    ['left', 'center', 'right'].forEach(pos => {
+        const f = document.getElementById('figure-layer-' + pos);
+        figures[pos] = (f && f.style.display !== 'none' && f.src) ? f.src : null;
+    });
+    const bgmEl = document.getElementById('bgm-player');
+    const bgm = bgmEl ? (bgmEl.src || '') : '';
+
     saveResumePoint(playStoryId, {
         chapterId: playChap.id,
         nodeId: currNodeId,
@@ -98,8 +114,235 @@ function saveReadProgress() {
         vars: [...currentVars],
         title: s.title || '',
         cover: s.cover || '',
-        chapterTitle: playChap.title || ''
+        chapterTitle: playChap.title || '',
+        bgImage,
+        figures,
+        bgm
     });
+}
+
+// ================= 通知系统 =================
+function _notifKey() { return 'vn_notifications_' + (currentUser ? currentUser.id : 'guest'); }
+function loadNotifications() {
+    try { return JSON.parse(localStorage.getItem(_notifKey()) || '[]') || []; } catch(e) { return []; }
+}
+function saveNotifications(list) {
+    try { localStorage.setItem(_notifKey(), JSON.stringify(list)); } catch(e) {}
+}
+function updateNotifBadge() {
+    const btn = document.getElementById('notif-btn');
+    const badge = document.getElementById('notif-badge');
+    if (!btn || !badge) return;
+    if (!currentUser) { btn.style.display = 'none'; badge.style.display = 'none'; return; }
+    btn.style.display = 'inline-block';
+    const list = loadNotifications();
+    const unread = list.filter(n => !n.read).length;
+    if (unread > 0) {
+        badge.innerText = unread > 99 ? '99+' : unread;
+        badge.style.display = 'block';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+async function detectStoryNotifications() {
+    if (!supabaseClient || !currentUser) return;
+    try {
+        const { data: follows, error: fErr } = await supabaseClient.from('follows').select('following_id').eq('follower_id', currentUser.id);
+        if (fErr) return;
+        const followingSet = new Set((follows || []).map(f => f.following_id));
+        if (followingSet.size === 0) return;
+
+        const seenKey = 'vn_seen_stories_' + currentUser.id;
+        let seen = {};
+        try { seen = JSON.parse(localStorage.getItem(seenKey) || '{}') || {}; } catch(e) { seen = {}; }
+        const isFirstTime = Object.keys(seen).length === 0;
+
+        const newNotifs = [];
+
+        for (const story of localStoriesCache) {
+            if (!story.user_id || story.user_id === currentUser.id) continue;
+            if (!followingSet.has(story.user_id)) continue;
+            if (story.is_draft === true) continue;
+
+            const hash = simpleHash(JSON.stringify({
+                title: story.title,
+                intro: story.intro,
+                cover: story.cover,
+                tags: story.tags,
+                chapters: (story.chapters || []).map(c => ({ id: c.id, title: c.title, nodeCount: (c.nodes || []).length }))
+            }));
+
+            const prev = seen[story.id];
+            if (!prev) {
+                if (!isFirstTime) {
+                    newNotifs.push({
+                        id: 'notif_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+                        type: 'new_story',
+                        storyId: story.id,
+                        storyTitle: story.title || '未命名',
+                        authorId: story.user_id,
+                        authorName: (globalProfilesCache[story.user_id] && globalProfilesCache[story.user_id].username) || story.author || '未知',
+                        authorAvatar: (globalProfilesCache[story.user_id] && globalProfilesCache[story.user_id].avatar_url) || story.author_avatar || DEFAULT_AVATAR,
+                        time: Date.now(),
+                        read: false
+                    });
+                }
+            } else if (prev.hash !== hash) {
+                newNotifs.push({
+                    id: 'notif_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+                    type: 'story_updated',
+                    storyId: story.id,
+                    storyTitle: story.title || '未命名',
+                    authorId: story.user_id,
+                    authorName: (globalProfilesCache[story.user_id] && globalProfilesCache[story.user_id].username) || story.author || '未知',
+                    authorAvatar: (globalProfilesCache[story.user_id] && globalProfilesCache[story.user_id].avatar_url) || story.author_avatar || DEFAULT_AVATAR,
+                    time: Date.now(),
+                    read: false
+                });
+            }
+            seen[story.id] = { hash };
+        }
+
+        try { localStorage.setItem(seenKey, JSON.stringify(seen)); } catch(e) {}
+
+        if (newNotifs.length > 0) {
+            const existing = loadNotifications();
+            const filtered = existing.filter(e => !newNotifs.some(n => n.storyId === e.storyId && n.type === e.type && !e.read));
+            const merged = [...newNotifs, ...filtered].slice(0, 100);
+            saveNotifications(merged);
+            updateNotifBadge();
+        }
+    } catch(e) {
+        console.error("detectStoryNotifications error:", e);
+    }
+}
+
+function renderNotifContent() {
+    const list = loadNotifications();
+    const container = document.getElementById('modal-content');
+    if (!container) return;
+    let html = '';
+    if (list.length === 0) {
+        html = '<div style="text-align:center; padding:30px; color:#888;">暂无通知</div>';
+    } else {
+        html = '<div style="max-height:60vh; overflow-y:auto; padding-right:5px;">';
+        list.forEach(n => {
+            const typeText = n.type === 'new_story' ? '发布了新作品' : '更新了作品';
+            const avatar = n.authorAvatar || DEFAULT_AVATAR;
+            html += `
+                <div style="display:flex; gap:10px; padding:12px 5px; border-bottom:1px solid #333; cursor:pointer; ${n.read ? 'opacity:0.6;' : ''}" onclick="handleNotifClick('${n.id}', '${n.storyId}')">
+                    <img src="${avatar}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;flex-shrink:0;">
+                    <div style="flex:1; min-width:0;">
+                        <div style="color:#fff; font-size:0.9rem; line-height:1.4;"><b>${escapeHtml(n.authorName)}</b> ${typeText} <span style="color:#c0a062;">《${escapeHtml(n.storyTitle)}》</span></div>
+                        <div style="color:#666; font-size:0.75rem; margin-top:4px;">${formatTime(n.time)}</div>
+                    </div>
+                    ${!n.read ? '<span style="width:8px;height:8px;background:#ff4d4f;border-radius:50%;flex-shrink:0;margin-top:6px;"></span>' : ''}
+                </div>
+            `;
+        });
+        html += '</div>';
+        if (list.some(n => !n.read)) {
+            html += `<button class="glass-btn" style="width:100%; margin-top:10px; font-size:0.85rem; padding:8px;" onclick="markAllNotifsRead()">全部标记已读</button>`;
+        }
+    }
+    container.innerHTML = html;
+}
+
+function openNotifPanel() {
+    if (!currentUser) return showToast("请先登录");
+    const titleEl = document.getElementById('modal-title');
+    if (titleEl) titleEl.innerText = '🔔 通知';
+    renderNotifContent();
+    const btn = document.getElementById('modal-confirm-btn');
+    if (btn) { btn.innerText = '关闭'; btn.onclick = () => closeModal(); }
+    document.getElementById('modal-overlay').classList.add('active');
+}
+
+function markAllNotifsRead() {
+    const list = loadNotifications();
+    list.forEach(n => n.read = true);
+    saveNotifications(list);
+    updateNotifBadge();
+    renderNotifContent();
+}
+
+function handleNotifClick(notifId, storyId) {
+    const list = loadNotifications();
+    const n = list.find(x => x.id === notifId);
+    if (n) { n.read = true; saveNotifications(list); updateNotifBadge(); }
+    closeModal();
+    if (storyId) location.hash = `#detail/${storyId}`;
+}
+
+// ================= 关注/粉丝列表 =================
+async function openFollowList(type) {
+    if (!currentUser) return showToast("请先登录");
+    if (!supabaseClient) return showToast("云端未连接");
+
+    const parts = window.location.hash.split('/');
+    let targetId = parts[1];
+    if (targetId === 'me') targetId = currentUser.id;
+    if (!targetId) return;
+
+    showToast("加载中...");
+
+    let ids = [];
+    try {
+        if (type === 'following') {
+            const { data, error } = await supabaseClient.from('follows').select('following_id').eq('follower_id', targetId);
+            if (error) throw error;
+            ids = (data || []).map(r => r.following_id);
+        } else {
+            const { data, error } = await supabaseClient.from('follows').select('follower_id').eq('following_id', targetId);
+            if (error) throw error;
+            ids = (data || []).map(r => r.follower_id);
+        }
+    } catch(e) {
+        return showToast("加载失败：" + (e.message || '请检查网络'));
+    }
+
+    const title = type === 'following' ? '关注列表' : '粉丝列表';
+
+    if (ids.length === 0) {
+        const titleEl = document.getElementById('modal-title');
+        if (titleEl) titleEl.innerText = title;
+        const container = document.getElementById('modal-content');
+        if (container) container.innerHTML = '<div style="padding:30px; text-align:center; color:#888;">暂无</div>';
+        const btn = document.getElementById('modal-confirm-btn');
+        if (btn) { btn.innerText = '关闭'; btn.onclick = () => closeModal(); }
+        document.getElementById('modal-overlay').classList.add('active');
+        return;
+    }
+
+    let profileMap = {};
+    try {
+        const { data: profiles } = await supabaseClient.from('profiles').select('*').in('id', ids);
+        (profiles || []).forEach(p => { profileMap[p.id] = p; });
+    } catch(e) {}
+
+    let html = '<div style="max-height:55vh; overflow-y:auto; padding-right:5px;">';
+    ids.forEach(id => {
+        const p = profileMap[id] || {};
+        const name = p.username || '未知用户';
+        const avatar = p.avatar_url || DEFAULT_AVATAR;
+        html += `
+            <div style="display:flex; align-items:center; gap:12px; padding:10px 5px; border-bottom:1px solid #333; cursor:pointer; transition:0.2s;" onmouseover="this.style.background='rgba(192,160,98,0.1)'" onmouseout="this.style.background=''" onclick="closeModal(); location.hash='#profile/${id}'">
+                <img src="${avatar}" style="width:44px;height:44px;border-radius:50%;object-fit:cover;flex-shrink:0;">
+                <div style="flex:1; color:#fff; font-weight:bold; word-break:break-word;">${escapeHtml(name)}</div>
+                <span style="color:#c0a062; font-size:1.1rem;">›</span>
+            </div>
+        `;
+    });
+    html += '</div>';
+
+    const titleEl = document.getElementById('modal-title');
+    if (titleEl) titleEl.innerText = title;
+    const container = document.getElementById('modal-content');
+    if (container) container.innerHTML = html;
+    const btn = document.getElementById('modal-confirm-btn');
+    if (btn) { btn.innerText = '关闭'; btn.onclick = () => closeModal(); }
+    document.getElementById('modal-overlay').classList.add('active');
 }
 
 // ================= 作者显示 =================
@@ -174,7 +417,6 @@ async function checkSession() {
         if (currentUser && (!globalProfilesCache[currentUser.id] || !globalProfilesCache[currentUser.id].username)) {
             openProfileModal(true);
         }
-
     } catch(e) {
         const statusEl = document.getElementById('cloud-status');
         if(statusEl) statusEl.innerText = '🔴 连接失败';
@@ -189,7 +431,6 @@ async function handleAuth(type) {
     const email = (document.getElementById('auth-email').value || '').trim();
     const password = document.getElementById('auth-password').value || '';
     if(!email || !password) return showToast("请填写完整的邮箱和密码");
-
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return showToast("❌ 邮箱格式不正确");
     if (password.length < 6) return showToast("❌ 密码至少需要 6 位");
 
@@ -237,11 +478,14 @@ async function handleLogout() {
     document.getElementById('logout-btn').style.display = 'none';
     document.getElementById('auth-btn').style.display = 'block';
     document.getElementById('profile-overlay').classList.remove('active');
+    const notifBtn = document.getElementById('notif-btn');
+    if (notifBtn) notifBtn.style.display = 'none';
     renderWorkspace(); await pullFromCloud();
     showToast("已退出登录");
 }
 
 function updateAuthUI() {
+    const notifBtn = document.getElementById('notif-btn');
     if (currentUser) {
         document.getElementById('auth-btn').style.display = 'none';
         document.getElementById('user-profile-area').style.display = 'flex';
@@ -253,10 +497,14 @@ function updateAuthUI() {
 
         document.getElementById('nav-avatar').src = savedAvatar;
         document.getElementById('nav-username').innerText = savedName;
+
+        if (notifBtn) notifBtn.style.display = 'inline-block';
+        updateNotifBadge();
     } else {
         document.getElementById('user-profile-area').style.display = 'none';
         document.getElementById('logout-btn').style.display = 'none';
         document.getElementById('auth-btn').style.display = 'block';
+        if (notifBtn) notifBtn.style.display = 'none';
     }
 }
 
@@ -388,7 +636,7 @@ async function renderProfilePage() {
         </div>
     `).join('') || '<div style="color:#888;">暂无作品</div>';
 
-    // ===== 最近观看记录（仅自己） =====
+    // 最近观看
     const recentSection = document.getElementById('prof-recent-section');
     const recentList = document.getElementById('prof-recent-list');
     if (recentSection && recentList) {
@@ -450,7 +698,9 @@ function resumeFromProfile(storyId) {
 
 async function toggleFollow() {
     if(!currentUser) return showToast("请先登录");
-    const targetId = window.location.hash.split('/')[1];
+    const parts = window.location.hash.split('/');
+    let targetId = parts[1];
+    if (targetId === 'me') targetId = currentUser.id;
     const btn = document.getElementById('btn-follow');
     const isFollowing = btn.innerText === '取消关注';
 
@@ -481,6 +731,8 @@ async function pullFromCloud() {
         if(hash === '' || hash === '#workspace') renderWorkspace();
         else if(hash === '#square') renderSquare();
         else if(hash.startsWith('#profile/')) renderProfilePage();
+
+        await detectStoryNotifications();
     } catch(e) {}
 }
 
@@ -522,7 +774,6 @@ let _lastRoutedHash = '';
 
 function router() {
     const hash = window.location.hash || '#workspace';
-
     window._prevHash = _lastRoutedHash;
     _lastRoutedHash = hash;
 
@@ -582,7 +833,6 @@ function openModal(title, html, cb) {
 }
 function closeModal() { document.getElementById('modal-overlay').classList.remove('active'); }
 
-// 确认弹窗：支持"确定"和"取消"各自回调
 let confirmCallback = null;
 let confirmCancelCallback = null;
 
@@ -599,18 +849,14 @@ async function handleConfirmOk() {
     document.getElementById('confirm-overlay').classList.remove('active');
     confirmCallback = null;
     confirmCancelCallback = null;
-    if (cb) {
-        try { await cb(); } catch(e) { console.error(e); }
-    }
+    if (cb) { try { await cb(); } catch(e) { console.error(e); } }
 }
 function handleConfirmCancel() {
     const cb = confirmCancelCallback;
     document.getElementById('confirm-overlay').classList.remove('active');
     confirmCallback = null;
     confirmCancelCallback = null;
-    if (cb) {
-        try { cb(); } catch(e) { console.error(e); }
-    }
+    if (cb) { try { cb(); } catch(e) { console.error(e); } }
 }
 function closeConfirm() { document.getElementById('confirm-overlay').classList.remove('active'); confirmCallback = null; confirmCancelCallback = null; }
 
@@ -765,7 +1011,6 @@ function deleteItem(type, id) {
 
 // ================= 角色立绘管理 =================
 let currentSpriteCharId = null;
-
 function openSpriteManager(charId) { currentSpriteCharId = charId; renderSpriteManager(); }
 
 function renderSpriteManager() {
@@ -963,13 +1208,11 @@ function renderDetail(id) {
         svg += `</svg>`; relArea.innerHTML = svg;
     }
 
-    // ===== 按钮逻辑 =====
     const btn = document.getElementById('btn-start');
     const btnChapters = document.getElementById('btn-chapters');
     const chapters = story.chapters || [];
     if (chapters.length === 0) {
-        btn.innerText = "暂无章节";
-        btn.style.background = "#ccc";
+        btn.innerText = "暂无章节"; btn.style.background = "#ccc";
         btn.onclick = () => showToast("作者还没写呢！");
         if (btnChapters) btnChapters.style.display = 'none';
     } else {
@@ -992,10 +1235,7 @@ function startStoryFromDetail(story) {
     const pts = getResumePoints();
     const rp = pts[story.id];
 
-    if (!rp || !rp.chapterId || !rp.nodeId) {
-        startFresh(story.id);
-        return;
-    }
+    if (!rp || !rp.chapterId || !rp.nodeId) { startFresh(story.id); return; }
 
     const chapterTitle = (chapters.find(c => c.id === rp.chapterId) || {}).title || '未知章节';
     showConfirm(
@@ -1005,9 +1245,7 @@ function startStoryFromDetail(story) {
             window._pendingResume = rp;
             location.hash = `#play/${story.id}/${rp.chapterId}`;
         },
-        () => {
-            startFresh(story.id);
-        }
+        () => { startFresh(story.id); }
     );
 }
 
@@ -1057,7 +1295,13 @@ function openChapterList(story) {
 
 function jumpToChapter(storyId, chapterId) {
     closeModal();
-    window._pendingResume = null;
+    const pts = getResumePoints();
+    const rp = pts[storyId];
+    if (rp && rp.chapterId === chapterId && rp.nodeId) {
+        window._pendingResume = rp;
+    } else {
+        window._pendingResume = null;
+    }
     location.hash = `#play/${storyId}/${chapterId}`;
 }
 
@@ -1363,7 +1607,6 @@ function editNode(id) {
     const story = getStories().find(s => s.id === currentManageId), ch = story.chapters.find(c => c.id === currentChapterId), node = ch.nodes.find(n => n.id === id);
     if (!node) return;
 
-    // start 节点：编辑入口标签
     if (node.type === 'start') {
         const html = `
             <p style="color:#c0a062; font-size:0.85rem; margin-bottom:15px; line-height:1.6;">
@@ -1400,7 +1643,6 @@ function editNode(id) {
             </div>
         `;
 
-        // dialogue/narration 允许设置入口标签（跨章伏笔不局限于 start 节点）
         if (node.type === 'dialogue' || node.type === 'narration') {
             html += `
                 <div class="form-group" style="border-top:1px dashed #444; padding-top:15px;">
@@ -1576,8 +1818,7 @@ function editNode(id) {
         }, 0);
     }
 }
-
-// ================= 自动排版算法 =================
+// ================= 自动排版算法（新版） =================
 function autoLayout() {
     const st = getStories().find(s => s.id === currentManageId);
     if (!st) return;
@@ -1603,8 +1844,8 @@ function autoLayout() {
     ch.nodes.forEach(n => { adj[n.id] = []; inDeg[n.id] = 0; parentsOf[n.id] = []; });
 
     ch.edges.forEach(e => {
-        if (!nodeIds.has(e.from) || !nodeIds.has(e.to)) return; // 悬空边
-        if (e.from === e.to) return; // 自环
+        if (!nodeIds.has(e.from) || !nodeIds.has(e.to)) return;
+        if (e.from === e.to) return;
         adj[e.from].push(e.to);
         inDeg[e.to]++;
         parentsOf[e.to].push(e.from);
@@ -1634,7 +1875,7 @@ function autoLayout() {
         });
     });
 
-    // 环上节点（拓扑未访问到的）→ 强行放到最右边
+    // 环上节点 → 强行放到最右边
     const reachedSet = new Set(topo);
     const unreached = ch.nodes.filter(n => !reachedSet.has(n.id));
     if (unreached.length > 0) {
@@ -1665,7 +1906,6 @@ function autoLayout() {
     const maxInLevel = Math.max(...sortedLevels.map(l => groups[l].length));
     const centerY = startY + (maxInLevel - 1) * gapY / 2;
 
-    // 保存原始顺序，便于 y 全相同时稳定排序
     const origIdx = {};
     ch.nodes.forEach((n, i) => origIdx[n.id] = i);
 
@@ -1675,14 +1915,12 @@ function autoLayout() {
         const nodes = groups[l];
 
         if (idx === 0) {
-            // 首层：按原 y 排序（保留作者手动布局），y 相同按原始顺序
             nodes.sort((a, b) => {
                 const ya = Number(a.y) || 0, yb = Number(b.y) || 0;
                 if (ya !== yb) return ya - yb;
                 return (origIdx[a.id] || 0) - (origIdx[b.id] || 0);
             });
         } else {
-            // 非首层：按父节点的平均 y 排序（barycenter）——保证分叉/合流走向顺畅
             nodes.sort((a, b) => {
                 const avgY = (n) => {
                     const ps = parentsOf[n.id] || [];
@@ -1732,109 +1970,369 @@ function autoLayout() {
     renderNodeEditor();
     showToast("✨ 排版完成");
 }
-function openAddRelationshipModal() { 
-    const s = getStories().find(x=>x.id===currentManageId); 
-    if(!s.characters || s.characters.length < 2) return showToast("需要至少2个角色"); 
-    const opts = s.characters.map(c=>`<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join(''); 
-    openModal("添加关系", `<div class="form-group"><label>A</label><select id="m-rel-from">${opts}</select></div><div class="form-group"><label>B</label><select id="m-rel-to">${opts}</select></div><div class="form-group"><label>标签</label><input type="text" id="m-rel-label"></div>`, () => { 
-        const f = document.getElementById('m-rel-from').value, t = document.getElementById('m-rel-to').value, l = document.getElementById('m-rel-label').value; 
-        if(f===t || !l) return; 
-        if(!s.relationships) s.relationships = []; 
-        s.relationships = s.relationships.filter(r => !(r.from === f && r.to === t) && !(r.from === t && r.to === f)); 
-        s.relationships.push({ from: f, to: t, label: l }); 
-        saveStories(getStories()); switchCharTab('graph'); 
-    }); 
+
+// ================= 新建章节/角色/地点/词条/关系 =================
+function openAddChapterModal() {
+    openModal("新章节", `<input type="text" id="m-ch-title" placeholder="标题">`, () => {
+        const t = document.getElementById('m-ch-title').value;
+        if(!t) return;
+        const s = getStories().find(x => x.id === currentManageId);
+        if(!s.chapters) s.chapters = [];
+        s.chapters.push({ id: 'ch_' + Date.now(), title: t, nodes: [], edges: [] });
+        saveStories(getStories());
+        renderManageSubPage('chapters');
+    });
 }
-function saveStoryInfo() { const s = getStories().find(x => x.id === currentManageId); if(!s) return; s.title = document.getElementById('edit-title').value; s.intro = document.getElementById('edit-intro').value; s.tags = document.getElementById('edit-tags').value.split(/[，,]/).map(t=>t.trim()).filter(Boolean); s.cover = document.getElementById('edit-cover').value; saveStories(getStories()); showToast("已保存"); setTimeout(()=>{location.hash=`#manage/${s.id}`}, 500); }
-function switchCharTab(t) { document.getElementById('tab-char-list').classList.toggle('active', t==='list'); document.getElementById('tab-char-graph').classList.toggle('active', t==='graph'); document.getElementById('char-content-list').style.display = t==='list'?'flex':'none'; document.getElementById('char-content-graph').style.display = t==='graph'?'block':'none'; if(t==='graph') renderRelationshipGraph(); }
+
+function openAddCharacterModal() {
+    openModal("新角色",
+        `<input type="text" id="m-c-name" placeholder="名字">
+         <textarea id="m-c-desc" rows="3" placeholder="简介" style="margin-top:10px;"></textarea>`,
+        () => {
+            const n = document.getElementById('m-c-name').value;
+            if(!n) return;
+            const s = getStories().find(x => x.id === currentManageId);
+            if(!s.characters) s.characters = [];
+            s.characters.push({ id: 'char_' + Date.now(), name: n, desc: document.getElementById('m-c-desc').value, sprites: [] });
+            saveStories(getStories());
+            renderManageSubPage('characters');
+        }
+    );
+}
+
+function openAddPlotModal() {
+    openModal("新地点",
+        `<input type="text" id="m-p-title" placeholder="名称">
+         <textarea id="m-p-desc" rows="3" placeholder="描述" style="margin-top:10px;"></textarea>`,
+        () => {
+            const t = document.getElementById('m-p-title').value;
+            if(!t) return;
+            const s = getStories().find(x => x.id === currentManageId);
+            if(!s.plots) s.plots = [];
+            s.plots.push({ id: 'plot_' + Date.now(), title: t, desc: document.getElementById('m-p-desc').value, x: 50, y: 50 });
+            saveStories(getStories());
+            renderManageSubPage('plots');
+        }
+    );
+}
+
+function openAddWikiModal() {
+    const s = getStories().find(x => x.id === currentManageId);
+    const chapterOpts = (s.chapters || []).map(c=>`<option value="${c.id}">读完 ${escapeHtml(c.title)} 解锁</option>`).join('');
+    openModal("新词条",
+        `<input type="text" id="m-w-term" placeholder="词条名">
+         <textarea id="m-w-content" rows="3" placeholder="内容" style="margin-top:10px;"></textarea>
+         <select id="m-w-unlock" style="margin-top:10px;width:100%;padding:5px;">
+             <option value="">所有人可见</option>${chapterOpts}
+         </select>`,
+        () => {
+            const t = document.getElementById('m-w-term').value;
+            if(!t) return;
+            if(!s.wiki) s.wiki = [];
+            s.wiki.push({
+                id: 'wiki_' + Date.now(),
+                term: t,
+                content: document.getElementById('m-w-content').value,
+                unlockChapter: document.getElementById('m-w-unlock').value
+            });
+            saveStories(getStories());
+            renderManageSubPage('wiki');
+        }
+    );
+}
+
+function openAddRelationshipModal() {
+    const s = getStories().find(x=>x.id===currentManageId);
+    if(!s.characters || s.characters.length < 2) return showToast("需要至少2个角色");
+    const opts = s.characters.map(c=>`<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
+    openModal("添加关系",
+        `<div class="form-group"><label>A</label><select id="m-rel-from">${opts}</select></div>
+         <div class="form-group"><label>B</label><select id="m-rel-to">${opts}</select></div>
+         <div class="form-group"><label>标签</label><input type="text" id="m-rel-label"></div>`,
+        () => {
+            const f = document.getElementById('m-rel-from').value;
+            const t = document.getElementById('m-rel-to').value;
+            const l = document.getElementById('m-rel-label').value;
+            if(f===t || !l) return;
+            if(!s.relationships) s.relationships = [];
+            s.relationships = s.relationships.filter(r => !(r.from === f && r.to === t) && !(r.from === t && r.to === f));
+            s.relationships.push({ from: f, to: t, label: l });
+            saveStories(getStories());
+            switchCharTab('graph');
+        }
+    );
+}
+
+function saveStoryInfo() {
+    const s = getStories().find(x => x.id === currentManageId);
+    if(!s) return;
+    s.title = document.getElementById('edit-title').value;
+    s.intro = document.getElementById('edit-intro').value;
+    s.tags = document.getElementById('edit-tags').value.split(/[，,]/).map(t=>t.trim()).filter(Boolean);
+    s.cover = document.getElementById('edit-cover').value;
+    saveStories(getStories());
+    showToast("已保存");
+    setTimeout(()=>{ location.hash = `#manage/${s.id}`; }, 500);
+}
+
+function switchCharTab(t) {
+    document.getElementById('tab-char-list').classList.toggle('active', t==='list');
+    document.getElementById('tab-char-graph').classList.toggle('active', t==='graph');
+    document.getElementById('char-content-list').style.display = t==='list'?'flex':'none';
+    document.getElementById('char-content-graph').style.display = t==='graph'?'block':'none';
+    if(t==='graph') renderRelationshipGraph();
+}
 
 function renderRelationshipGraph() {
-    const s = getStories().find(x => x.id === currentManageId); const area = document.getElementById('relationship-graph-area');
+    const s = getStories().find(x => x.id === currentManageId);
+    const area = document.getElementById('relationship-graph-area');
     if (!s || !s.characters || s.characters.length < 2) { area.innerHTML = ''; return; }
     const chars = s.characters, rels = s.relationships || [];
-    const nodes = chars.map((c, i) => { const a = (i / chars.length) * 2 * Math.PI - Math.PI / 2; return { ...c, x: 400 + 150 * Math.cos(a), y: 250 + 150 * Math.sin(a) }; });
+    const nodes = chars.map((c, i) => {
+        const a = (i / chars.length) * 2 * Math.PI - Math.PI / 2;
+        return { ...c, x: 400 + 150 * Math.cos(a), y: 250 + 150 * Math.sin(a) };
+    });
     let svg = `<svg width="100%" height="100%" viewBox="0 0 800 500" preserveAspectRatio="xMidYMid meet">`;
-    rels.forEach(r => { const n1 = nodes.find(n => n.name === r.from), n2 = nodes.find(n => n.name === r.to); if (n1 && n2) { svg += `<line x1="${n1.x}" y1="${n1.y}" x2="${n2.x}" y2="${n2.y}" stroke="#ccc" stroke-width="2" />`; const mx = (n1.x + n2.x) / 2, my = (n1.y + n2.y) / 2; svg += `<rect x="${mx-30}" y="${my-12}" width="60" height="24" fill="#fcf9f2" rx="12" /><text x="${mx}" y="${my+4}" fill="#c0a062" font-size="13" text-anchor="middle" font-weight="bold">${escapeHtml(r.label)}</text>`; } });
-    nodes.forEach(n => { svg += `<g transform="translate(${n.x}, ${n.y})"><circle r="45" fill="#fff" stroke="#c0a062" stroke-width="2"/><text y="5" fill="#333" font-size="15" font-weight="bold" text-anchor="middle">${escapeHtml(n.name)}</text></g>`; });
+    rels.forEach(r => {
+        const n1 = nodes.find(n => n.name === r.from), n2 = nodes.find(n => n.name === r.to);
+        if (n1 && n2) {
+            svg += `<line x1="${n1.x}" y1="${n1.y}" x2="${n2.x}" y2="${n2.y}" stroke="#ccc" stroke-width="2" />`;
+            const mx = (n1.x + n2.x) / 2, my = (n1.y + n2.y) / 2;
+            svg += `<rect x="${mx-30}" y="${my-12}" width="60" height="24" fill="#fcf9f2" rx="12" />`;
+            svg += `<text x="${mx}" y="${my+4}" fill="#c0a062" font-size="13" text-anchor="middle" font-weight="bold">${escapeHtml(r.label)}</text>`;
+        }
+    });
+    nodes.forEach(n => {
+        svg += `<g transform="translate(${n.x}, ${n.y})"><circle r="45" fill="#fff" stroke="#c0a062" stroke-width="2"/><text y="5" fill="#333" font-size="15" font-weight="bold" text-anchor="middle">${escapeHtml(n.name)}</text></g>`;
+    });
     area.innerHTML = svg + `</svg>`;
 }
 
-function exportData() { const dataStr = JSON.stringify(localStoriesCache, null, 2); const blob = new Blob([dataStr], {type: "application/json"}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `backup.json`; a.click(); }
-function importData(e) { const f = e.target.files[0]; if(!f) return; const r = new FileReader(); r.onload = (ev) => { try { let imp = JSON.parse(ev.target.result); if(!Array.isArray(imp)) imp = imp.stories || [imp]; let nc = [...localStoriesCache]; imp.forEach(x => { if(x.id && x.title) { const idx = nc.findIndex(y => y.id === x.id); if(idx === -1) nc.push(x); else nc[idx] = x; } }); saveStories(nc); renderWorkspace(); showToast("导入成功"); } catch(err) { showToast("格式错误"); } }; r.readAsText(f); }
+function exportData() {
+    const dataStr = JSON.stringify(localStoriesCache, null, 2);
+    const blob = new Blob([dataStr], {type: "application/json"});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `backup.json`;
+    a.click();
+}
+
+function importData(e) {
+    const f = e.target.files[0];
+    if(!f) return;
+    const r = new FileReader();
+    r.onload = (ev) => {
+        try {
+            let imp = JSON.parse(ev.target.result);
+            if(!Array.isArray(imp)) imp = imp.stories || [imp];
+            let nc = [...localStoriesCache];
+            imp.forEach(x => {
+                if(x.id && x.title) {
+                    const idx = nc.findIndex(y => y.id === x.id);
+                    if(idx === -1) nc.push(x);
+                    else nc[idx] = x;
+                }
+            });
+            saveStories(nc);
+            renderWorkspace();
+            showToast("导入成功");
+        } catch(err) {
+            showToast("格式错误");
+        }
+    };
+    r.readAsText(f);
+}
+
+// ================= 预览入口 =================
+function previewChapter() {
+    if (!currentManageId || !currentChapterId) return;
+    const story = getStories().find(s => s.id === currentManageId);
+    if (!story) return;
+    const chapter = (story.chapters || []).find(c => c.id === currentChapterId);
+    if (!chapter) return;
+
+    // 收集本章所有入口：所有 start 节点 + 所有带 entryKey 的 dialogue/narration
+    const entries = [];
+    (chapter.nodes || []).forEach(n => {
+        if (!n || !n.type) return;
+        if (n.type === 'start') {
+            entries.push({
+                nodeId: n.id,
+                label: n.entryKey
+                    ? `🚩 开始 · [${n.entryKey}]`
+                    : '🚩 默认入口（无标签开始）'
+            });
+        } else if ((n.type === 'dialogue' || n.type === 'narration') && n.entryKey) {
+            const textPreview = (n.text || '').substring(0, 24);
+            const more = (n.text || '').length > 24 ? '...' : '';
+            entries.push({
+                nodeId: n.id,
+                label: `🚩 [${n.entryKey}] ${n.type === 'dialogue' ? (n.name || '角色') : '旁白'}：${textPreview}${more}`
+            });
+        }
+    });
+
+    // 无入口兜底
+    if (entries.length === 0) {
+        if (!chapter.nodes || chapter.nodes.length === 0) {
+            return showToast("本章还没有节点，无法预览");
+        }
+        _startPreviewWith(chapter.nodes[0].id);
+        return;
+    }
+
+    // 只有一个入口：直接预览
+    if (entries.length === 1) {
+        _startPreviewWith(entries[0].nodeId);
+        return;
+    }
+
+    // 多个入口：弹窗让作者选择
+    let html = `
+        <p style="color:#c0a062; font-size:0.85rem; margin-bottom:15px; line-height:1.6;">
+            💡 本章有 <b>${entries.length}</b> 个可能的入口（多个开始节点，或带入口标签的节点）。
+            请选择从哪个入口开始预览。<br>
+            <span style="color:#888;">本次预览不会影响读者的真实进度和分支走向。</span>
+        </p>
+        <div style="max-height:50vh; overflow-y:auto; display:flex; flex-direction:column; gap:8px;">
+    `;
+    entries.forEach(e => {
+        html += `
+            <button class="glass-btn"
+                style="text-align:left; padding:12px 15px; border-color:#c0a062; color:#fff !important; background:rgba(192,160,98,0.15); white-space:normal; line-height:1.4; word-break:break-word;"
+                onclick="startPreviewFrom('${e.nodeId}')">
+                ${escapeHtml(e.label)}
+            </button>
+        `;
+    });
+    html += `</div>`;
+
+    document.getElementById('modal-title').innerText = '▶ 选择预览入口';
+    document.getElementById('modal-content').innerHTML = html;
+    const btn = document.getElementById('modal-confirm-btn');
+    btn.innerText = '关闭';
+    btn.onclick = () => closeModal();
+    document.getElementById('modal-overlay').classList.add('active');
+}
+
+function _startPreviewWith(nodeId) {
+    window._isPreview = true;
+    window._pendingResume = null;
+    window._previewEntryNodeId = nodeId || null;
+    location.hash = `#play/${currentManageId}/${currentChapterId}`;
+}
+
+function startPreviewFrom(nodeId) {
+    closeModal();
+    _startPreviewWith(nodeId);
+}
 
 // ================= 播放器核心 =================
 let currNodeId = null, isTyping = false, typeTimer = null, chIdx = 0, txt = "", hist = [], isAuto = false, isSkip = false, autoT = null, skipT = null, playStoryId = null, playChap = null;
 let currentVars = [];
 
-function previewChapter() {
-    if (!currentManageId || !currentChapterId) return;
-    window._isPreview = true;
-    window._pendingResume = null;
-    location.hash = `#play/${currentManageId}/${currentChapterId}`;
-}
-
 function startPlayer(sid, cid) {
-    playStoryId = sid; 
-    const s = getStories().find(x => x.id === sid); 
+    playStoryId = sid;
+    const s = getStories().find(x => x.id === sid);
     if (!s) return;
     playChap = (s.chapters || []).find(x => x.id === cid);
     if (!playChap) { showToast("章节不存在"); location.hash = `#detail/${sid}`; return; }
-    
+
     document.getElementById('bg-layer').style.backgroundImage = s.bg ? `url('${s.bg}')` : 'none';
-    ['left', 'center', 'right'].forEach(pos => { const f = document.getElementById('figure-layer-' + pos); if (f) f.style.display = 'none'; });
+    ['left', 'center', 'right'].forEach(pos => { const f = document.getElementById('figure-layer-' + pos); if (f) { f.style.display = 'none'; f.src = ''; } });
+    const bgmEl = document.getElementById('bgm-player');
+    bgmEl.pause(); bgmEl.src = '';
+
     document.getElementById('choices-container').style.display = 'none';
-    document.getElementById('bgm-player').pause(); 
-    hist = []; updateHist(); 
-    isAuto = false; isSkip = false; 
-    clearTimeout(autoT); clearTimeout(skipT); 
-    document.getElementById('btn-auto').style.color = '#fff'; 
+    hist = []; updateHist();
+    isAuto = false; isSkip = false;
+    clearTimeout(autoT); clearTimeout(skipT);
+    document.getElementById('btn-auto').style.color = '#fff';
     document.getElementById('btn-skip').style.color = '#fff';
-    
-    // ===== 状态恢复 =====
+
+    // ===== 预览分支 =====
+    if (window._isPreview) {
+        currentVars = [];
+        const previewEntryId = window._previewEntryNodeId;
+        window._previewEntryNodeId = null;
+
+        let chosen = null;
+        if (previewEntryId) {
+            chosen = (playChap.nodes || []).find(n => n.id === previewEntryId) || null;
+        }
+        if (!chosen) {
+            const startNodes = (playChap.nodes || []).filter(n => n.type === 'start');
+            chosen = startNodes.find(n => !n.entryKey) || startNodes[0] || (playChap.nodes || [])[0] || null;
+        }
+        if (!chosen) {
+            showToast("本章没有可用节点");
+            window._isPreview = false;
+            location.hash = `#manage/${sid}/node-editor/${cid}`;
+            return;
+        }
+        currNodeId = chosen.id;
+        processNode();
+        return;
+    }
+
+    // ===== 正常游戏分支 =====
     const ps = loadPlayState(sid);
     const rp = window._pendingResume;
     window._pendingResume = null;
-    
-    if (rp && rp.chapterId === cid) {
+
+    let chosen = null;
+
+    if (rp && rp.chapterId === cid && rp.nodeId) {
         currentVars = Array.isArray(rp.vars) ? [...rp.vars] : [];
         ps.pendingEntry = rp.pendingEntry || '';
         ps.vars = [...currentVars];
         savePlayState(sid, ps);
+
+        chosen = (playChap.nodes || []).find(n => n.id === rp.nodeId) || null;
+
+        if (chosen) {
+            const bgLayer = document.getElementById('bg-layer');
+            if (bgLayer) {
+                bgLayer.style.backgroundImage = rp.bgImage || (s.bg ? `url('${s.bg}')` : 'none');
+            }
+            ['left', 'center', 'right'].forEach(pos => {
+                const f = document.getElementById('figure-layer-' + pos);
+                if (!f) return;
+                const val = rp.figures ? rp.figures[pos] : null;
+                if (val) { f.src = val; f.style.display = 'block'; }
+                else { f.style.display = 'none'; }
+            });
+            if (rp.bgm) {
+                bgmEl.src = rp.bgm;
+                bgmEl.play().catch(() => {});
+            }
+        }
     } else {
         currentVars = Array.isArray(ps.vars) ? [...ps.vars] : [];
     }
-    
-    // ===== 选择起始节点 =====
-    let chosen = null;
-    
-    // 1. 断点恢复（章节匹配时才用）
-    if (rp && rp.chapterId === cid && rp.nodeId) {
-        chosen = (playChap.nodes || []).find(n => n.id === rp.nodeId) || null;
-    }
-    // 2. pendingEntry 匹配任意带 entryKey 的节点
+
     if (!chosen && ps.pendingEntry) {
         chosen = (playChap.nodes || []).find(n => (n.entryKey || '') === ps.pendingEntry) || null;
     }
-    // 3. 默认 start 节点（无 entryKey 优先）
     if (!chosen) {
         const startNodes = (playChap.nodes || []).filter(n => n.type === 'start');
         chosen = startNodes.find(n => !n.entryKey) || startNodes[0] || null;
     }
-    
+
     if (!chosen) {
-        showToast("本章无可用入口节点，请检查节点编辑器");
+        showToast("本章无可用入口节点");
         location.hash = `#detail/${sid}`;
         return;
     }
-    
+
     currNodeId = chosen.id;
     processNode();
 }
 
 function processNode() {
     clearTimeout(autoT); clearTimeout(skipT);
-    saveReadProgress();  // 保存断点（每次进入新节点）
-    
+    saveReadProgress();
+
     const n = (playChap.nodes || []).find(x => x.id === currNodeId);
     if (!n) { showChapterEnd(""); return; }
     if (n.type === 'end') { showChapterEnd(n.text || ""); return; }
@@ -1845,15 +2343,21 @@ function processNode() {
         varsToAdd.forEach(v => { if (!currentVars.includes(v)) currentVars.push(v); });
     }
 
-    if (n.type === 'bgm') { const a = document.getElementById('bgm-player'); if(n.bgm) { a.src = n.bgm; a.play().catch(()=>{}); } else { a.pause(); a.src = ''; } nextNode(); return; }
-    
-    if (n.type === 'illustration') { 
-        const bg = document.getElementById('bg-layer'); 
-        if (n.hide) { bg.style.backgroundImage = 'none'; } else if (n.img) { bg.style.backgroundImage = `url('${n.img}')`; }
-        nextNode(); return; 
+    if (n.type === 'bgm') {
+        const a = document.getElementById('bgm-player');
+        if(n.bgm) { a.src = n.bgm; a.play().catch(()=>{}); }
+        else { a.pause(); a.src = ''; }
+        nextNode(); return;
     }
-    
-    if (n.type === 'figure') { 
+
+    if (n.type === 'illustration') {
+        const bg = document.getElementById('bg-layer');
+        if (n.hide) { bg.style.backgroundImage = 'none'; }
+        else if (n.img) { bg.style.backgroundImage = `url('${n.img}')`; }
+        nextNode(); return;
+    }
+
+    if (n.type === 'figure') {
         const fLeft = document.getElementById('figure-layer-left');
         const fCenter = document.getElementById('figure-layer-center');
         const fRight = document.getElementById('figure-layer-right');
@@ -1872,7 +2376,7 @@ function processNode() {
                 if (n.img) { targetEl.src = n.img; targetEl.style.display = 'block'; } else { targetEl.style.display = 'none'; }
             }
         }
-        nextNode(); return; 
+        nextNode(); return;
     }
 
     if (n.type === 'branch') {
@@ -1898,25 +2402,88 @@ function processNode() {
     }
 }
 
-function typeText() { if (chIdx < txt.length) { document.getElementById('dialogue-text').innerText += txt.charAt(chIdx); chIdx++; typeTimer = setTimeout(typeText, isSkip ? 10 : 30); } else { isTyping = false; document.getElementById('next-indicator').style.display = 'block'; if (isAuto) autoT = setTimeout(nextNode, 1500); if (isSkip) skipT = setTimeout(nextNode, 100); } }
-function nextLine() { if (isTyping) { clearTimeout(typeTimer); document.getElementById('dialogue-text').innerText = txt; isTyping = false; document.getElementById('next-indicator').style.display = 'block'; if (isAuto) autoT = setTimeout(nextNode, 1500); if (isSkip) skipT = setTimeout(nextNode, 100); } else { nextNode(); } }
+function typeText() {
+    if (chIdx < txt.length) {
+        document.getElementById('dialogue-text').innerText += txt.charAt(chIdx);
+        chIdx++;
+        typeTimer = setTimeout(typeText, isSkip ? 10 : 30);
+    } else {
+        isTyping = false;
+        document.getElementById('next-indicator').style.display = 'block';
+        if (isAuto) autoT = setTimeout(nextNode, 1500);
+        if (isSkip) skipT = setTimeout(nextNode, 100);
+    }
+}
+
+function nextLine() {
+    if (isTyping) {
+        clearTimeout(typeTimer);
+        document.getElementById('dialogue-text').innerText = txt;
+        isTyping = false;
+        document.getElementById('next-indicator').style.display = 'block';
+        if (isAuto) autoT = setTimeout(nextNode, 1500);
+        if (isSkip) skipT = setTimeout(nextNode, 100);
+    } else {
+        nextNode();
+    }
+}
+
 document.getElementById('textbox-container').onclick = nextLine;
-document.addEventListener('keydown', (e) => { if (document.getElementById('view-player').classList.contains('active') && (e.code === 'Space' || e.code === 'Enter')) nextLine(); });
-function toggleAuto() { isAuto = !isAuto; isSkip = false; document.getElementById('btn-auto').style.color = isAuto ? '#c0a062' : '#fff'; document.getElementById('btn-skip').style.color = '#fff'; if (isAuto && !isTyping) autoT = setTimeout(nextNode, 1500); else clearTimeout(autoT); clearTimeout(skipT); }
-function toggleSkip() { isSkip = !isSkip; isAuto = false; document.getElementById('btn-skip').style.color = isSkip ? '#c0a062' : '#fff'; document.getElementById('btn-auto').style.color = '#fff'; if (isSkip) { if (isTyping) { clearTimeout(typeTimer); document.getElementById('dialogue-text').innerText = txt; isTyping = false; document.getElementById('next-indicator').style.display = 'block'; } skipT = setTimeout(nextNode, 100); } else clearTimeout(skipT); clearTimeout(autoT); }
-document.addEventListener('click', e => { const p = document.getElementById('history-panel'); if (p && p.classList.contains('open')) { if (!p.contains(e.target) && !e.target.closest('button[onclick="toggleHistory()"]')) p.classList.remove('open'); } });
-function updateHist() { const l = document.getElementById('history-list'); l.innerHTML = hist.map(h => `<div style="margin-bottom:10px;"><div style="color:#888;font-size:0.9em;">${escapeHtml(h.name)}</div><div style="color:#ddd;">${escapeHtml(h.text)}</div></div>`).join(''); l.scrollTop = l.scrollHeight; }
+document.addEventListener('keydown', (e) => {
+    if (document.getElementById('view-player').classList.contains('active') && (e.code === 'Space' || e.code === 'Enter')) nextLine();
+});
+
+function toggleAuto() {
+    isAuto = !isAuto; isSkip = false;
+    document.getElementById('btn-auto').style.color = isAuto ? '#c0a062' : '#fff';
+    document.getElementById('btn-skip').style.color = '#fff';
+    if (isAuto && !isTyping) autoT = setTimeout(nextNode, 1500);
+    else clearTimeout(autoT);
+    clearTimeout(skipT);
+}
+
+function toggleSkip() {
+    isSkip = !isSkip; isAuto = false;
+    document.getElementById('btn-skip').style.color = isSkip ? '#c0a062' : '#fff';
+    document.getElementById('btn-auto').style.color = '#fff';
+    if (isSkip) {
+        if (isTyping) {
+            clearTimeout(typeTimer);
+            document.getElementById('dialogue-text').innerText = txt;
+            isTyping = false;
+            document.getElementById('next-indicator').style.display = 'block';
+        }
+        skipT = setTimeout(nextNode, 100);
+    } else clearTimeout(skipT);
+    clearTimeout(autoT);
+}
+
+document.addEventListener('click', e => {
+    const p = document.getElementById('history-panel');
+    if (p && p.classList.contains('open')) {
+        if (!p.contains(e.target) && !e.target.closest('button[onclick="toggleHistory()"]')) p.classList.remove('open');
+    }
+});
+
+function updateHist() {
+    const l = document.getElementById('history-list');
+    l.innerHTML = hist.map(h => `<div style="margin-bottom:10px;"><div style="color:#888;font-size:0.9em;">${escapeHtml(h.name)}</div><div style="color:#ddd;">${escapeHtml(h.text)}</div></div>`).join('');
+    l.scrollTop = l.scrollHeight;
+}
+
 function toggleHistory() { document.getElementById('history-panel').classList.toggle('open'); }
 
-function showChoices(eds, branchNode) { 
-    document.getElementById('textbox-container').style.display = 'none'; 
-    const c = document.getElementById('choices-container'); 
-    c.innerHTML = ''; 
-    
+function showChoices(eds, branchNode) {
+    document.getElementById('textbox-container').style.display = 'none';
+    const c = document.getElementById('choices-container');
+    c.innerHTML = '';
+
     const validEds = eds.filter(ed => {
         if (ed.branchIndex === undefined) return true;
         const opt = branchNode.options[ed.branchIndex];
         if (!opt) return false;
+        // 预览时：显示所有分支，方便作者测试
+        if (window._isPreview) return true;
         const reqs = splitConditions(opt.reqVars);
         if (reqs.length === 0) return true;
         return reqs.every(r => currentVars.includes(r));
@@ -1931,26 +2498,38 @@ function showChoices(eds, branchNode) {
         return;
     }
 
-    validEds.forEach((ed, i) => { 
-        const btn = document.createElement('button'); 
-        btn.className = 'choice-btn'; 
+    validEds.forEach((ed, i) => {
+        const btn = document.createElement('button');
+        btn.className = 'choice-btn';
         const opt = (branchNode && branchNode.options && ed.branchIndex !== undefined && branchNode.options[ed.branchIndex]) ? branchNode.options[ed.branchIndex] : null;
-        btn.innerText = opt ? opt.text : `选项 ${i+1}`; 
-        btn.onclick = () => { 
-            // 跨章伏笔：持久化 pendingEntry（会一直保留，直到被新的分支选择覆盖）
-            if (opt && opt.nextEntry) {
+
+        let label = opt ? opt.text : `选项 ${i+1}`;
+        // 预览时标注条件是否满足
+        if (window._isPreview && opt && opt.reqVars) {
+            const reqs = splitConditions(opt.reqVars);
+            const missing = reqs.filter(r => !currentVars.includes(r));
+            if (missing.length > 0) {
+                label += `  ⚠️ [预览中，实际需: ${missing.join('、')}]`;
+            } else if (reqs.length > 0) {
+                label += `  ✅ [条件已满足]`;
+            }
+        }
+        btn.innerText = label;
+
+        btn.onclick = () => {
+            if (!window._isPreview && opt && opt.nextEntry) {
                 const ps = loadPlayState(playStoryId);
                 ps.pendingEntry = opt.nextEntry;
                 ps.vars = [...currentVars];
                 savePlayState(playStoryId, ps);
             }
-            c.style.display = 'none'; 
-            currNodeId = ed.to; 
-            processNode(); 
-        }; 
-        c.appendChild(btn); 
-    }); 
-    c.style.display = 'flex'; 
+            c.style.display = 'none';
+            currNodeId = ed.to;
+            processNode();
+        };
+        c.appendChild(btn);
+    });
+    c.style.display = 'flex';
 }
 
 function nextNode() {
@@ -1975,16 +2554,22 @@ function nextNode() {
 function showChapterEnd(t) {
     document.getElementById('textbox-container').style.display = 'none';
     const ov = document.getElementById('chapter-end-overlay'), c = document.getElementById('end-content-area');
-    if (playChap) { let rh = []; try { rh = JSON.parse(safeGetLocal('vn_read_history') || '[]'); } catch(e){} if (!rh.includes(playChap.id)) { rh.push(playChap.id); safeSetLocal('vn_read_history', JSON.stringify(rh)); } }
+    if (playChap && !window._isPreview) {
+        let rh = [];
+        try { rh = JSON.parse(safeGetLocal('vn_read_history') || '[]'); } catch(e){}
+        if (!rh.includes(playChap.id)) { rh.push(playChap.id); safeSetLocal('vn_read_history', JSON.stringify(rh)); }
+    }
 
-    c.innerHTML = t && t.trim() ? `<h3 style="color:#c0a062; margin-bottom:15px; text-align:center;">结局</h3><p style="white-space:pre-wrap; text-align:justify;">${escapeHtml(t)}</p>` : `<h3 style="color:#c0a062; margin-bottom:15px; text-align:center;">本章已看完</h3>`;
+    c.innerHTML = t && t.trim()
+        ? `<h3 style="color:#c0a062; margin-bottom:15px; text-align:center;">结局</h3><p style="white-space:pre-wrap; text-align:justify;">${escapeHtml(t)}</p>`
+        : `<h3 style="color:#c0a062; margin-bottom:15px; text-align:center;">本章已看完</h3>`;
     ov.classList.add('active');
 
     const s = getStories().find(x => x.id === playStoryId);
     const ci = (s.chapters || []).findIndex(x => x.id === playChap.id);
     const nb = document.getElementById('btn-next-chapter');
 
-    if (ci >= 0 && ci < s.chapters.length - 1) {
+    if (ci >= 0 && ci < s.chapters.length - 1 && !window._isPreview) {
         nb.style.display = 'block'; nb.disabled = false; nb.style.opacity = '1'; nb.style.cursor = 'pointer';
     } else {
         nb.style.display = 'block'; nb.disabled = true; nb.style.opacity = '0.5'; nb.style.cursor = 'not-allowed';
@@ -1998,14 +2583,17 @@ function goNextChapter() {
         location.hash = `#play/${s.id}/${s.chapters[ci+1].id}`;
     }
 }
-function goHomeFromEnd() { document.getElementById('chapter-end-overlay').classList.remove('active'); document.getElementById('bgm-player').pause(); location.hash = '#workspace'; }
-function goBackFromEnd() { document.getElementById('chapter-end-overlay').classList.remove('active'); document.getElementById('bgm-player').pause(); location.hash = `#detail/${playStoryId}`; }
 
-function exitPlayer() {
-    clearTimeout(autoT); clearTimeout(skipT);
+function goHomeFromEnd() {
+    document.getElementById('chapter-end-overlay').classList.remove('active');
     document.getElementById('bgm-player').pause();
-    document.getElementById('textbox-container').onclick = nextLine;
-    saveReadProgress();
+    window._isPreview = false;
+    location.hash = '#workspace';
+}
+
+function goBackFromEnd() {
+    document.getElementById('chapter-end-overlay').classList.remove('active');
+    document.getElementById('bgm-player').pause();
     if (window._isPreview) {
         window._isPreview = false;
         location.hash = `#manage/${playStoryId}/node-editor/${playChap.id}`;
@@ -2014,41 +2602,113 @@ function exitPlayer() {
     }
 }
 
+function exitPlayer() {
+    clearTimeout(autoT); clearTimeout(skipT);
+    document.getElementById('bgm-player').pause();
+    document.getElementById('textbox-container').onclick = nextLine;
+    saveReadProgress();
+
+    if (window._isPreview) {
+        window._isPreview = false;
+        window._previewEntryNodeId = null;
+        location.hash = `#manage/${playStoryId}/node-editor/${playChap.id}`;
+    } else {
+        location.hash = `#detail/${playStoryId}`;
+    }
+}
+
 // ================= 地图编辑器 =================
 let isDrawing = false, brushColor = '#2E8B57';
-function setBrush(c, b) { brushColor = c; document.querySelectorAll('.brush-btn').forEach(x => x.classList.remove('active')); b.classList.add('active'); }
-function zoomMap(v) { const g = document.getElementById('map-grid'); if(g) { g.style.gridTemplateColumns = `repeat(40, ${v}px)`; g.style.gridTemplateRows = `repeat(40, ${v}px)`; } }
-function switchPlotTab(t) { document.getElementById('tab-plot-list').classList.toggle('active', t==='list'); document.getElementById('tab-plot-map').classList.toggle('active', t==='map'); document.getElementById('plot-content-list').style.display = t==='list'?'flex':'none'; document.getElementById('plot-content-map').style.display = t==='map'?'block':'none'; if(t==='map') renderMapEditor(); }
+function setBrush(c, b) {
+    brushColor = c;
+    document.querySelectorAll('.brush-btn').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+}
+function zoomMap(v) {
+    const g = document.getElementById('map-grid');
+    if(g) {
+        g.style.gridTemplateColumns = `repeat(40, ${v}px)`;
+        g.style.gridTemplateRows = `repeat(40, ${v}px)`;
+    }
+}
+function switchPlotTab(t) {
+    document.getElementById('tab-plot-list').classList.toggle('active', t==='list');
+    document.getElementById('tab-plot-map').classList.toggle('active', t==='map');
+    document.getElementById('plot-content-list').style.display = t==='list'?'flex':'none';
+    document.getElementById('plot-content-map').style.display = t==='map'?'block':'none';
+    if(t==='map') renderMapEditor();
+}
 function renderMapEditor() {
-    const s = getStories().find(x => x.id === currentManageId); if(!s) return;
-    let wr = document.querySelector('.map-grid-wrapper'); if (!wr) { document.getElementById('map-viewport').innerHTML = '<div class="map-grid-wrapper" id="map-grid-wrapper"><div class="map-grid" id="map-grid"></div></div>'; wr = document.getElementById('map-grid-wrapper'); }
-    const g = document.getElementById('map-grid'); g.innerHTML = ''; const md = s.mapGrid || new Array(1600).fill('transparent'); zoomMap(document.getElementById('map-zoom').value);
-    
-    md.forEach((c, i) => { 
-        const cell = document.createElement('div'); cell.className = 'map-cell'; cell.style.backgroundColor = c; 
-        cell.onpointerdown = (e) => { isDrawing = true; drawCell(cell, i); e.preventDefault(); }; 
-        cell.onpointerenter = () => { if (isDrawing) drawCell(cell, i); }; 
-        g.appendChild(cell); 
+    const s = getStories().find(x => x.id === currentManageId);
+    if(!s) return;
+    let wr = document.querySelector('.map-grid-wrapper');
+    if (!wr) {
+        document.getElementById('map-viewport').innerHTML = '<div class="map-grid-wrapper" id="map-grid-wrapper"><div class="map-grid" id="map-grid"></div></div>';
+        wr = document.getElementById('map-grid-wrapper');
+    }
+    const g = document.getElementById('map-grid');
+    g.innerHTML = '';
+    const md = s.mapGrid || new Array(1600).fill('transparent');
+    zoomMap(document.getElementById('map-zoom').value);
+
+    md.forEach((c, i) => {
+        const cell = document.createElement('div');
+        cell.className = 'map-cell';
+        cell.style.backgroundColor = c;
+        cell.onpointerdown = (e) => { isDrawing = true; drawCell(cell, i); e.preventDefault(); };
+        cell.onpointerenter = () => { if (isDrawing) drawCell(cell, i); };
+        g.appendChild(cell);
     });
     document.onpointerup = () => { isDrawing = false; };
-    
+
     (s.plots || []).forEach(p => {
-        const pin = document.createElement('div'); pin.className = 'map-pin'; pin.style.left = `${p.x}%`; pin.style.top = `${p.y}%`; pin.innerHTML = `<div style="font-size:24px;">📍</div><div style="font-size:12px; background:rgba(0,0,0,0.8); color:#fff; padding:2px 6px; border-radius:4px; white-space:nowrap;">${escapeHtml(p.title)}</div>`;
+        const pin = document.createElement('div');
+        pin.className = 'map-pin';
+        pin.style.left = `${p.x}%`;
+        pin.style.top = `${p.y}%`;
+        pin.innerHTML = `<div style="font-size:24px;">📍</div><div style="font-size:12px; background:rgba(0,0,0,0.8); color:#fff; padding:2px 6px; border-radius:4px; white-space:nowrap;">${escapeHtml(p.title)}</div>`;
         pin.onpointerdown = (e) => {
-            e.stopPropagation(); e.preventDefault(); 
+            e.stopPropagation(); e.preventDefault();
             const sx = e.clientX, sy = e.clientY, r = g.getBoundingClientRect(), il = parseFloat(pin.style.left), it = parseFloat(pin.style.top);
-            const mm = (ev) => { let nx = il + ((ev.clientX - sx) / r.width) * 100, ny = it + ((ev.clientY - sy) / r.height) * 100; nx = Math.max(0, Math.min(100, nx)); ny = Math.max(0, Math.min(100, ny)); pin.style.left = `${nx}%`; pin.style.top = `${ny}%`; };
-            const mu = () => { document.removeEventListener('pointermove', mm); document.removeEventListener('pointerup', mu); document.removeEventListener('pointercancel', mu); const st = getStories().find(x => x.id === currentManageId), tg = st.plots.find(x => x.id === p.id); if (tg) { tg.x = parseFloat(pin.style.left); tg.y = parseFloat(pin.style.top); saveStories(getStories()); showToast("已保存"); } };
-            document.addEventListener('pointermove', mm); document.addEventListener('pointerup', mu); document.addEventListener('pointercancel', mu);
+            const mm = (ev) => {
+                let nx = il + ((ev.clientX - sx) / r.width) * 100;
+                let ny = it + ((ev.clientY - sy) / r.height) * 100;
+                nx = Math.max(0, Math.min(100, nx));
+                ny = Math.max(0, Math.min(100, ny));
+                pin.style.left = `${nx}%`; pin.style.top = `${ny}%`;
+            };
+            const mu = () => {
+                document.removeEventListener('pointermove', mm);
+                document.removeEventListener('pointerup', mu);
+                document.removeEventListener('pointercancel', mu);
+                const st = getStories().find(x => x.id === currentManageId), tg = st.plots.find(x => x.id === p.id);
+                if (tg) {
+                    tg.x = parseFloat(pin.style.left);
+                    tg.y = parseFloat(pin.style.top);
+                    saveStories(getStories());
+                    showToast("已保存");
+                }
+            };
+            document.addEventListener('pointermove', mm);
+            document.addEventListener('pointerup', mu);
+            document.addEventListener('pointercancel', mu);
         };
         g.appendChild(pin);
     });
 }
-function drawCell(c, i) { c.style.backgroundColor = brushColor; const s = getStories().find(x => x.id === currentManageId); if (!s.mapGrid) s.mapGrid = new Array(1600).fill('transparent'); s.mapGrid[i] = brushColor; saveStories(getStories()); }
+function drawCell(c, i) {
+    c.style.backgroundColor = brushColor;
+    const s = getStories().find(x => x.id === currentManageId);
+    if (!s.mapGrid) s.mapGrid = new Array(1600).fill('transparent');
+    s.mapGrid[i] = brushColor;
+    saveStories(getStories());
+}
 
+// ================= 创建新小说 =================
 function openCreateStoryModal() {
     openModal("创建新小说", `<div class="form-group"><label>标题</label><input type="text" id="m-title" value=""></div>`, () => {
-        const title = document.getElementById('m-title').value; if(!title) return showToast("请输入标题");
+        const title = document.getElementById('m-title').value;
+        if(!title) return showToast("请输入标题");
         let authorName = '', authorAvatar = DEFAULT_AVATAR;
         if (currentUser) {
             const p = globalProfilesCache[currentUser.id];
@@ -2057,6 +2717,7 @@ function openCreateStoryModal() {
         }
         const stories = getStories();
         stories.push({ id: 'story_' + Date.now(), title, author: authorName, author_avatar: authorAvatar, intro: '', status: 'private', cover: '', tags: [], chapters: [], characters: [], plots: [], wiki: [], relationships: [], mapGrid: new Array(1600).fill('transparent'), is_draft: true });
-        saveStories(stories); renderWorkspace();
+        saveStories(stories);
+        renderWorkspace();
     });
 }
