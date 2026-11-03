@@ -1580,81 +1580,157 @@ function editNode(id) {
 // ================= 自动排版算法 =================
 function autoLayout() {
     const st = getStories().find(s => s.id === currentManageId);
+    if (!st) return;
     const ch = st.chapters.find(c => c.id === currentChapterId);
-    if (!ch || !ch.nodes || ch.nodes.length === 0) return;
+    if (!ch || !ch.nodes || ch.nodes.length === 0) {
+        return showToast("没有节点需要排版");
+    }
+    if (!Array.isArray(ch.edges)) ch.edges = [];
 
-    const levels = {}; 
-    const visited = new Set();
-    const startNode = ch.nodes.find(n => n.type === 'start');
-    
-    const queue = [{ id: startNode ? startNode.id : null, level: 0 }];
-    while(queue.length > 0) {
-        const { id, level } = queue.shift();
-        if (!id || visited.has(id)) continue;
-        visited.add(id);
-        if (!levels[level]) levels[level] = [];
-        levels[level].push(id);
+    // 单节点：直接放到标准位置
+    if (ch.nodes.length === 1) {
+        ch.nodes[0].x = 100;
+        ch.nodes[0].y = 150;
+        saveStories(getStories());
+        renderNodeEditor();
+        showToast("✨ 排版完成");
+        return;
+    }
 
-        const outEdges = ch.edges.filter(e => e.from === id);
-        outEdges.forEach(e => {
-            if (!visited.has(e.to)) queue.push({ id: e.to, level: level + 1 });
+    // ===== 1. 建立邻接表 / 入度 / 父节点表 =====
+    const nodeIds = new Set(ch.nodes.map(n => n.id));
+    const adj = {}, inDeg = {}, parentsOf = {};
+    ch.nodes.forEach(n => { adj[n.id] = []; inDeg[n.id] = 0; parentsOf[n.id] = []; });
+
+    ch.edges.forEach(e => {
+        if (!nodeIds.has(e.from) || !nodeIds.has(e.to)) return; // 悬空边
+        if (e.from === e.to) return; // 自环
+        adj[e.from].push(e.to);
+        inDeg[e.to]++;
+        parentsOf[e.to].push(e.from);
+    });
+
+    // ===== 2. Kahn 拓扑排序（检测环） =====
+    const q = ch.nodes.filter(n => inDeg[n.id] === 0).map(n => n.id);
+    const topo = [];
+    const queueCopy = [...q];
+    const degCopy = { ...inDeg };
+    while (queueCopy.length > 0) {
+        const id = queueCopy.shift();
+        topo.push(id);
+        (adj[id] || []).forEach(to => {
+            degCopy[to]--;
+            if (degCopy[to] === 0) queueCopy.push(to);
         });
     }
 
-    ch.nodes.forEach(n => {
-        if (!visited.has(n.id)) {
-            const maxLvl = Object.keys(levels).length;
-            if (!levels[maxLvl]) levels[maxLvl] = [];
-            levels[maxLvl].push(n.id);
-        }
+    // ===== 3. 最长路径 DP 计算层级 =====
+    const level = {};
+    ch.nodes.forEach(n => level[n.id] = 0);
+    topo.forEach(id => {
+        (adj[id] || []).forEach(to => {
+            const newLvl = level[id] + 1;
+            if (newLvl > level[to]) level[to] = newLvl;
+        });
     });
 
-    let maxNodesInLevel = 0;
-    Object.keys(levels).forEach(lvl => { maxNodesInLevel = Math.max(maxNodesInLevel, levels[lvl].length); });
-
-    const startX = 100; const gapX = 280; 
-    const startY = 100; const gapY = 120; 
-    let maxX = 0, maxY = 0;
-
-    Object.keys(levels).forEach(lvl => {
-        const nodesInLvl = levels[lvl];
-        const startOffsetY = startY + (maxNodesInLevel - nodesInLvl.length) * gapY / 2;
-        nodesInLvl.forEach((nodeId, index) => {
-            const node = ch.nodes.find(n => n.id === nodeId);
-            if (node) {
-                node.x = startX + parseInt(lvl) * gapX;
-                node.y = startOffsetY + index * gapY;
-                maxX = Math.max(maxX, node.x); maxY = Math.max(maxY, node.y);
+    // 环上节点（拓扑未访问到的）→ 强行放到最右边
+    const reachedSet = new Set(topo);
+    const unreached = ch.nodes.filter(n => !reachedSet.has(n.id));
+    if (unreached.length > 0) {
+        let maxLvl = 0;
+        Object.values(level).forEach(v => { if (v > maxLvl) maxLvl = v; });
+        unreached.forEach(n => {
+            const ps = parentsOf[n.id] || [];
+            const parentLevels = ps.map(pid => level[pid]).filter(v => v !== undefined);
+            let myLvl = maxLvl + 1;
+            if (parentLevels.length > 0) {
+                myLvl = Math.max(Math.max(...parentLevels) + 1, maxLvl + 1);
             }
+            level[n.id] = myLvl;
+        });
+    }
+
+    // ===== 4. 分组 =====
+    const groups = {};
+    ch.nodes.forEach(n => {
+        const l = level[n.id];
+        if (!groups[l]) groups[l] = [];
+        groups[l].push(n);
+    });
+    const sortedLevels = Object.keys(groups).map(Number).sort((a, b) => a - b);
+
+    // ===== 5. 逐层布局（重心排序） =====
+    const gapX = 320, gapY = 140, startX = 100, startY = 100;
+    const maxInLevel = Math.max(...sortedLevels.map(l => groups[l].length));
+    const centerY = startY + (maxInLevel - 1) * gapY / 2;
+
+    // 保存原始顺序，便于 y 全相同时稳定排序
+    const origIdx = {};
+    ch.nodes.forEach((n, i) => origIdx[n.id] = i);
+
+    const rowY = {};
+
+    sortedLevels.forEach((l, idx) => {
+        const nodes = groups[l];
+
+        if (idx === 0) {
+            // 首层：按原 y 排序（保留作者手动布局），y 相同按原始顺序
+            nodes.sort((a, b) => {
+                const ya = Number(a.y) || 0, yb = Number(b.y) || 0;
+                if (ya !== yb) return ya - yb;
+                return (origIdx[a.id] || 0) - (origIdx[b.id] || 0);
+            });
+        } else {
+            // 非首层：按父节点的平均 y 排序（barycenter）——保证分叉/合流走向顺畅
+            nodes.sort((a, b) => {
+                const avgY = (n) => {
+                    const ps = parentsOf[n.id] || [];
+                    const ys = ps.map(pid => rowY[pid]).filter(v => v !== undefined);
+                    if (ys.length === 0) return Infinity;
+                    return ys.reduce((s, v) => s + v, 0) / ys.length;
+                };
+                const av = avgY(a), bv = avgY(b);
+                if (av !== bv) return av - bv;
+                const ya = Number(a.y) || 0, yb = Number(b.y) || 0;
+                if (ya !== yb) return ya - yb;
+                return (origIdx[a.id] || 0) - (origIdx[b.id] || 0);
+            });
+        }
+
+        const totalH = (nodes.length - 1) * gapY;
+        const baseY = centerY - totalH / 2;
+        nodes.forEach((n, i) => {
+            n.x = startX + idx * gapX;
+            n.y = baseY + i * gapY;
+            rowY[n.id] = n.y;
         });
     });
 
-    let canvas = document.getElementById('node-canvas');
-    let svg = document.getElementById('node-svg');
+    // ===== 6. 更新画布尺寸 =====
+    let maxX = 0, maxY = 0;
+    ch.nodes.forEach(n => {
+        const ex = (n.x || 0) + 260;
+        const ey = (n.y || 0) + 100;
+        if (ex > maxX) maxX = ex;
+        if (ey > maxY) maxY = ey;
+    });
+    const canvas = document.getElementById('node-canvas');
+    const svg = document.getElementById('node-svg');
     if (canvas && svg) {
-        let newW = Math.max(3000, maxX + 800); 
-        let newH = Math.max(3000, maxY + 500); 
-        canvas.style.width = newW + 'px'; canvas.style.height = newH + 'px';
-        svg.setAttribute('width', newW); svg.setAttribute('height', newH);
-        svg.style.width = newW + 'px'; svg.style.height = newH + 'px';
+        const newW = Math.max(3000, maxX + 200);
+        const newH = Math.max(3000, maxY + 200);
+        canvas.style.width = newW + 'px';
+        canvas.style.height = newH + 'px';
+        svg.setAttribute('width', newW);
+        svg.setAttribute('height', newH);
+        svg.style.width = newW + 'px';
+        svg.style.height = newH + 'px';
     }
 
-    saveStories(getStories()); renderNodeEditor(); showToast("✨ 排版完成");
-}
-
-function openAddChapterModal() { openModal("新章节", `<input type="text" id="m-ch-title" placeholder="标题">`, () => { const t = document.getElementById('m-ch-title').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); if(!s.chapters) s.chapters=[]; s.chapters.push({ id: 'ch_'+Date.now(), title: t, nodes: [], edges: [] }); saveStories(getStories()); renderManageSubPage('chapters'); }); }
-function openAddCharacterModal() { openModal("新角色", `<input type="text" id="m-c-name" placeholder="名字"><textarea id="m-c-desc" rows="3" placeholder="简介" style="margin-top:10px;"></textarea>`, () => { const n = document.getElementById('m-c-name').value; if(!n) return; const s = getStories().find(x => x.id === currentManageId); if(!s.characters) s.characters=[]; s.characters.push({ id: 'char_'+Date.now(), name: n, desc: document.getElementById('m-c-desc').value, sprites: [] }); saveStories(getStories()); renderManageSubPage('characters'); }); }
-function openAddPlotModal() { openModal("新地点", `<input type="text" id="m-p-title" placeholder="名称"><textarea id="m-p-desc" rows="3" placeholder="描述" style="margin-top:10px;"></textarea>`, () => { const t = document.getElementById('m-p-title').value; if(!t) return; const s = getStories().find(x => x.id === currentManageId); if(!s.plots) s.plots=[]; s.plots.push({ id: 'plot_'+Date.now(), title: t, desc: document.getElementById('m-p-desc').value, x: 50, y: 50 }); saveStories(getStories()); renderManageSubPage('plots'); }); }
-
-function openAddWikiModal() { 
-    const s = getStories().find(x => x.id === currentManageId);
-    const chapterOpts = (s.chapters || []).map(c=>`<option value="${c.id}">读完 ${escapeHtml(c.title)} 解锁</option>`).join('');
-    openModal("新词条", `<input type="text" id="m-w-term" placeholder="词条名"><textarea id="m-w-content" rows="3" placeholder="内容" style="margin-top:10px;"></textarea><select id="m-w-unlock" style="margin-top:10px;width:100%;padding:5px;"><option value="">所有人可见</option>${chapterOpts}</select>`, () => { 
-        const t = document.getElementById('m-w-term').value; if(!t) return; 
-        if(!s.wiki) s.wiki=[]; 
-        s.wiki.push({ id: 'wiki_'+Date.now(), term: t, content: document.getElementById('m-w-content').value, unlockChapter: document.getElementById('m-w-unlock').value }); 
-        saveStories(getStories()); renderManageSubPage('wiki'); 
-    }); 
+    saveStories(getStories());
+    renderNodeEditor();
+    showToast("✨ 排版完成");
 }
 function openAddRelationshipModal() { 
     const s = getStories().find(x=>x.id===currentManageId); 
