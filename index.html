@@ -279,7 +279,8 @@
         <div id="player-top-bar">
             <button class="glass-btn" onclick="exitPlayer()">← 退出剧情</button>
             <div class="right-controls">
-                <button class="glass-btn" id="btn-auto" onclick="toggleAuto()">▶ 自动</button>
+              <button class="glass-btn" onclick="openBranchHistory()">⏳ 回溯</button>  
+<button class="glass-btn" id="btn-auto" onclick="toggleAuto()">▶ 自动</button>
                 <button class="glass-btn" id="btn-skip" onclick="toggleSkip()">» 快进</button>
                 <button class="glass-btn" onclick="toggleHistory()">🕒 历史</button>
             </div>
@@ -294,6 +295,8 @@
             <div class="glass-confirm-box">
                 <div id="end-content-area"></div>
                 <div class="confirm-actions" style="margin-top: 20px; justify-content: center; flex-wrap: wrap;">
+                    <!-- 新增的回到选择点按钮 --><!-- 将原来的 btn-rewind-branch 那一行替换为： -->
+<button class="glass-btn" id="btn-rewind-branch" onclick="openBranchHistory()" style="display:none; min-width: 100px; color:#c0a062 !important; border-color:#c0a062;">⏳ 剧情回溯</button>
                     <button class="glass-btn" onclick="goBackFromEnd()" style="min-width: 100px;">返回详情页</button>
                     <button class="glass-btn" onclick="goHomeFromEnd()" style="min-width: 100px;">返回主界面</button>
                     <button class="btn-gold" id="btn-next-chapter" onclick="goNextChapter()" style="min-width: 100px;">下一章</button>

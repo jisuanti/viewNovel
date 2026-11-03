@@ -64,14 +64,9 @@ function getResumePoints() {
 function saveResumePoint(storyId, data) {
     try {
         const map = getResumePoints();
-        map[storyId] = { ...data, timestamp: Date.now() };
-        localStorage.setItem('vn_resume_points', JSON.stringify(map));
-    } catch(e) {}
-}
-function clearResumePoint(storyId) {
-    try {
-        const map = getResumePoints();
-        delete map[storyId];
+        const existing = map[storyId] || {}; 
+        // 使用 { ...existing, ...data } 合并数据，这样就不会把 lastBranchNodeId 覆盖掉了
+        map[storyId] = { ...existing, ...data, timestamp: Date.now() };
         localStorage.setItem('vn_resume_points', JSON.stringify(map));
     } catch(e) {}
 }
@@ -1237,7 +1232,49 @@ function startStoryFromDetail(story) {
 
     if (!rp || !rp.chapterId || !rp.nodeId) { startFresh(story.id); return; }
 
-    const chapterTitle = (chapters.find(c => c.id === rp.chapterId) || {}).title || '未知章节';
+    const chapter = chapters.find(c => c.id === rp.chapterId);
+    let isAtEnd = false;
+    if (chapter) {
+        const node = (chapter.nodes || []).find(n => n.id === rp.nodeId);
+        if (node && node.type === 'end') isAtEnd = true;
+    }
+
+    const chapterTitle = (chapter || {}).title || '未知章节';
+    
+    // 检测到上次看的是结局
+    if (isAtEnd) {
+        if (rp.lastBranchNodeId) {
+            showConfirm(
+                "上次已看完结局",
+                `检测到你上次已经看完了《${chapterTitle}》的结局。\n\n点「确定」回到本章最后一个选择点重新选择\n点「取消」从头开始阅读本章`,
+                () => {
+                    rp.nodeId = rp.lastBranchNodeId;
+                    rp.vars = rp.lastBranchVars ? [...rp.lastBranchVars] : [];
+                    delete rp.lastBranchNodeId;
+                    delete rp.lastBranchVars;
+                    safeSetLocal('vn_resume_points', JSON.stringify(pts));
+                    window._pendingResume = rp;
+                    location.hash = `#play/${story.id}/${rp.chapterId}`;
+                },
+                () => {
+                    rp.nodeId = null;
+                    delete rp.lastBranchNodeId;
+                    delete rp.lastBranchVars;
+                    safeSetLocal('vn_resume_points', JSON.stringify(pts));
+                    window._pendingResume = rp;
+                    location.hash = `#play/${story.id}/${rp.chapterId}`;
+                }
+            );
+            return;
+        } else {
+            showToast("上次已看完本章，即将从头开始");
+            window._pendingResume = null;
+            location.hash = `#play/${story.id}/${rp.chapterId}`;
+            return;
+        }
+    }
+
+    // 普通进度继续
     showConfirm(
         "继续阅读？",
         `检测到上次读到《${chapterTitle}》\n\n点「确定」从上次位置继续\n点「取消」从头开始观看`,
@@ -2483,7 +2520,6 @@ function showChoices(eds, branchNode) {
         if (ed.branchIndex === undefined) return true;
         const opt = branchNode.options[ed.branchIndex];
         if (!opt) return false;
-        // 预览时：显示所有分支，方便作者测试
         if (window._isPreview) return true;
         const reqs = splitConditions(opt.reqVars);
         if (reqs.length === 0) return true;
@@ -2505,7 +2541,6 @@ function showChoices(eds, branchNode) {
         const opt = (branchNode && branchNode.options && ed.branchIndex !== undefined && branchNode.options[ed.branchIndex]) ? branchNode.options[ed.branchIndex] : null;
 
         let label = opt ? opt.text : `选项 ${i+1}`;
-        // 预览时标注条件是否满足
         if (window._isPreview && opt && opt.reqVars) {
             const reqs = splitConditions(opt.reqVars);
             const missing = reqs.filter(r => !currentVars.includes(r));
@@ -2518,11 +2553,33 @@ function showChoices(eds, branchNode) {
         btn.innerText = label;
 
         btn.onclick = () => {
-            if (!window._isPreview && opt && opt.nextEntry) {
-                const ps = loadPlayState(playStoryId);
-                ps.pendingEntry = opt.nextEntry;
-                ps.vars = [...currentVars];
-                savePlayState(playStoryId, ps);
+            if (!window._isPreview) {
+                // 记录历史选择
+                const history = getBranchHistory(playStoryId);
+                history.push({
+                    chapterId: playChap.id,
+                    chapterTitle: playChap.title || '未命名章节',
+                    nodeId: currNodeId,
+                    varsBefore: [...currentVars],
+                    chosenText: opt ? opt.text : '未知选项',
+                    timestamp: Date.now()
+                });
+                saveBranchHistory(playStoryId, history);
+                
+                // 兼容之前的断点，记录最后一次分支
+                const pts = getResumePoints();
+                if (pts[playStoryId]) {
+                    pts[playStoryId].lastBranchNodeId = currNodeId;
+                    pts[playStoryId].lastBranchVars = [...currentVars];
+                    safeSetLocal('vn_resume_points', JSON.stringify(pts));
+                }
+
+                if (opt && opt.nextEntry) {
+                    const ps = loadPlayState(playStoryId);
+                    ps.pendingEntry = opt.nextEntry;
+                    ps.vars = [...currentVars];
+                    savePlayState(playStoryId, ps);
+                }
             }
             c.style.display = 'none';
             currNodeId = ed.to;
@@ -2574,6 +2631,100 @@ function showChapterEnd(t) {
         nb.style.display = 'block'; nb.disabled = false; nb.style.opacity = '1'; nb.style.cursor = 'pointer';
     } else {
         nb.style.display = 'block'; nb.disabled = true; nb.style.opacity = '0.5'; nb.style.cursor = 'not-allowed';
+    }
+
+    // ===== 判断是否显示“剧情回溯”按钮 =====
+    const btnRewind = document.getElementById('btn-rewind-branch');
+    if (btnRewind) {
+        const history = getBranchHistory(playStoryId);
+        if (history.length > 0 && !window._isPreview) {
+            btnRewind.style.display = 'block';
+        } else {
+            btnRewind.style.display = 'none';
+        }
+    }
+}
+    // ===== 新增：判断是否显示“回到选择点”按钮 =====
+    const btnRewind = document.getElementById('btn-rewind-branch');
+    if (btnRewind) {
+        const pts = getResumePoints();
+        const rp = pts[playStoryId];
+        if (rp && rp.lastBranchNodeId && !window._isPreview) {
+            btnRewind.style.display = 'block';
+        } else {
+            btnRewind.style.display = 'none';
+        }
+    }
+
+// ===== 新增：回到选择点函数 =====
+function openBranchHistory() {
+    if (!playStoryId) return;
+    const history = getBranchHistory(playStoryId);
+    if (history.length === 0) return showToast("还没有经历过任何选择点");
+
+    let html = '<div style="max-height:60vh; overflow-y:auto; padding-right:5px;">';
+    // 倒序展示，最新的在最上面
+    for (let i = history.length - 1; i >= 0; i--) {
+        const h = history[i];
+        html += `
+            <div style="background:rgba(255,255,255,0.05); border:1px solid #444; border-radius:8px; padding:12px; margin-bottom:10px; cursor:pointer; transition:0.2s;" onmouseover="this.style.background='rgba(192,160,98,0.15)'" onmouseout="this.style.background='rgba(255,255,255,0.05)'" onclick="rewindToHistory(${i})">
+                <div style="color:#c0a062; font-size:0.85rem; margin-bottom:5px;">📍 ${escapeHtml(h.chapterTitle)}</div>
+                <div style="color:#fff; font-size:0.95rem;">选了：<b>${escapeHtml(h.chosenText)}</b></div>
+                <div style="color:#52c41a; font-size:0.75rem; margin-top:5px;">👉 点击回到这里重选</div>
+            </div>
+        `;
+    }
+    html += '</div>';
+
+    document.getElementById('modal-title').innerText = '⏳ 剧情回溯';
+    document.getElementById('modal-content').innerHTML = html;
+    const btn = document.getElementById('modal-confirm-btn');
+    btn.innerText = '关闭';
+    btn.onclick = () => closeModal();
+    document.getElementById('modal-overlay').classList.add('active');
+}
+
+function rewindToHistory(index) {
+    if (!playStoryId) return;
+    const history = getBranchHistory(playStoryId);
+    const h = history[index];
+    if (!h) return;
+
+    closeModal();
+    document.getElementById('chapter-end-overlay').classList.remove('active');
+
+    // 截断历史记录（保留到当前重选的前一步）
+    const newHistory = history.slice(0, index);
+    saveBranchHistory(playStoryId, newHistory);
+
+    // 同步清理最后的断点状态
+    const pts = getResumePoints();
+    if (pts[playStoryId]) {
+        pts[playStoryId].lastBranchNodeId = h.nodeId;
+        pts[playStoryId].lastBranchVars = [...h.varsBefore];
+        safeSetLocal('vn_resume_points', JSON.stringify(pts));
+    }
+
+    // 如果是在不同的章节触发的，需要先跨章跳转
+    if (playChap.id !== h.chapterId) {
+        let ps = loadPlayState(playStoryId);
+        ps.vars = [...h.varsBefore];
+        savePlayState(playStoryId, ps);
+
+        window._pendingResume = {
+            chapterId: h.chapterId,
+            nodeId: h.nodeId,
+            vars: [...h.varsBefore],
+            pendingEntry: ps.pendingEntry || ''
+        };
+        location.hash = `#play/${playStoryId}/${h.chapterId}`;
+    } else {
+        // 同章直接原地跳跃
+        currentVars = [...h.varsBefore];
+        currNodeId = h.nodeId;
+        document.getElementById('textbox-container').style.display = 'none';
+        document.getElementById('choices-container').style.display = 'none';
+        processNode();
     }
 }
 
@@ -2721,4 +2872,10 @@ function openCreateStoryModal() {
         saveStories(stories);
         renderWorkspace();
     });
+}
+function getBranchHistory(storyId) {
+    try { return JSON.parse(localStorage.getItem('vn_branch_history_' + storyId) || '[]'); } catch(e) { return []; }
+}
+function saveBranchHistory(storyId, history) {
+    try { localStorage.setItem('vn_branch_history_' + storyId, JSON.stringify(history)); } catch(e) {}
 }
