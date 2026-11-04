@@ -2,17 +2,33 @@
 const SUPABASE_URL = 'https://opzllintslozjchwjcjn.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9wemxsaW50c2xvempjaHdqY2puIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM0NjQxNzksImV4cCI6MjEwOTA0MDE3OX0.jrPeGJqWj2oN4hiqjNoSfEsY-U2g06SSEOwmdK6PbAg';
 
+const DEFAULT_AVATAR = 'https://ui-avatars.com/api/?name=User&background=333&color=fff&size=128';
+const IMG_HOST_HINT = 'https://img.remit.ee/image-to-url';
+
+// ================= 全局变量（只在第一段声明一次） =================
 let supabaseClient = null;
 let currentUser = null;
 let localStoriesCache = [];
 let globalProfilesCache = {};
-const DEFAULT_AVATAR = 'https://ui-avatars.com/api/?name=User&background=333&color=fff&size=128';
-const IMG_HOST_HINT = 'https://img.remit.ee/image-to-url';
-
 let _dragging = false;
 let _linking = false;
 
-// ================= 工具 =================
+let currentManageId = null, currentChapterId = null, currentDetailStory = null;
+let _lastRoutedHash = '';
+
+let toastTimer;
+let confirmCallback = null;
+let confirmCancelCallback = null;
+
+let currNodeId = null, isTyping = false, typeTimer = null, chIdx = 0, txt = "", hist = [], isAuto = false, isSkip = false, autoT = null, skipT = null, playStoryId = null, playChap = null;
+let currentVars = [];
+
+let currentSpriteCharId = null;
+let isDrawing = false, brushColor = '#2E8B57';
+let bgmFadeTimer = null;
+let currentBgmUrl = "";
+
+// ================= 工具函数 =================
 function safeGetLocal(k){try{return localStorage.getItem(k)}catch(e){return null}}
 function safeSetLocal(k,v){try{localStorage.setItem(k,v)}catch(e){}}
 function safeBind(id,e,f){const el=document.getElementById(id);if(el)el[e]=f}
@@ -29,7 +45,7 @@ function simpleHash(str) {
     return h.toString(36);
 }
 
-// ================= 玩法状态（跨章伏笔核心） =================
+// ================= 状态管理 =================
 function _loadStateMap() {
     try { return JSON.parse(localStorage.getItem('vn_play_state') || '{}') || {}; } catch(e) { return {}; }
 }
@@ -65,10 +81,23 @@ function saveResumePoint(storyId, data) {
     try {
         const map = getResumePoints();
         const existing = map[storyId] || {}; 
-        // 使用 { ...existing, ...data } 合并数据，这样就不会把 lastBranchNodeId 覆盖掉了
         map[storyId] = { ...existing, ...data, timestamp: Date.now() };
         localStorage.setItem('vn_resume_points', JSON.stringify(map));
     } catch(e) {}
+}
+function clearResumePoint(storyId) {
+    try {
+        const map = getResumePoints();
+        delete map[storyId];
+        localStorage.setItem('vn_resume_points', JSON.stringify(map));
+    } catch(e) {}
+}
+
+function getBranchHistory(storyId) {
+    try { return JSON.parse(localStorage.getItem('vn_branch_history_' + storyId) || '[]'); } catch(e) { return []; }
+}
+function saveBranchHistory(storyId, history) {
+    try { localStorage.setItem('vn_branch_history_' + storyId, JSON.stringify(history)); } catch(e) {}
 }
 
 function formatTime(ts) {
@@ -82,9 +111,8 @@ function formatTime(ts) {
     return `${d.getMonth()+1}月${d.getDate()}日`;
 }
 
-// 保存进度快照（含背景/立绘/BGM）
 function saveReadProgress() {
-    if (window._isPreview) return;  // 预览不保存进度
+    if (window._isPreview) return; 
     if (!playStoryId || !playChap || !currNodeId) return;
     const s = getStories().find(x => x.id === playStoryId);
     if (!s) return;
@@ -114,6 +142,102 @@ function saveReadProgress() {
         figures,
         bgm
     });
+
+    if (currentUser && supabaseClient) {
+        const p = globalProfilesCache[currentUser.id] || {};
+        let rv = p.recent_views || [];
+        if (!Array.isArray(rv)) rv = [];
+        
+        rv = rv.filter(x => x.storyId !== playStoryId);
+        rv.unshift({ 
+            storyId: playStoryId, 
+            chapterId: playChap.id, 
+            chapterTitle: playChap.title || '未知章节', 
+            timestamp: Date.now() 
+        });
+        if (rv.length > 20) rv = rv.slice(0, 20); 
+
+        supabaseClient.from('profiles').update({ recent_views: rv }).eq('id', currentUser.id).then(({error}) => {
+            if (!error) {
+                if (!globalProfilesCache[currentUser.id]) globalProfilesCache[currentUser.id] = {};
+                globalProfilesCache[currentUser.id].recent_views = rv;
+            }
+        });
+    }
+}
+
+// ================= BGM 管理 =================
+function stopBgmForce() {
+    clearInterval(bgmFadeTimer);
+    const audio = document.getElementById('bgm-player');
+    if (audio) {
+        audio.pause();
+        audio.src = '';
+        audio.volume = 1;
+    }
+    currentBgmUrl = "";
+}
+
+function playBgmWithFade(url) {
+    const audio = document.getElementById('bgm-player');
+    if (!audio) return;
+    
+    if (!url) {
+        if (audio.paused) return;
+        clearInterval(bgmFadeTimer);
+        let vol = audio.volume;
+        bgmFadeTimer = setInterval(() => {
+            vol -= 0.1;
+            if (vol <= 0) {
+                vol = 0;
+                clearInterval(bgmFadeTimer);
+                audio.pause();
+                audio.src = '';
+                audio.volume = 1; 
+                currentBgmUrl = "";
+            }
+            audio.volume = vol;
+        }, 30);
+        return;
+    }
+
+    if (currentBgmUrl === url && !audio.paused) return;
+
+    clearInterval(bgmFadeTimer);
+
+    if (audio.src && !audio.paused) {
+        let vol = audio.volume;
+        bgmFadeTimer = setInterval(() => {
+            vol -= 0.1;
+            if (vol <= 0) {
+                vol = 0;
+                clearInterval(bgmFadeTimer);
+                audio.pause();
+                _startNewBgm(url);
+            }
+            audio.volume = vol;
+        }, 30);
+    } else {
+        _startNewBgm(url);
+    }
+}
+
+function _startNewBgm(url) {
+    const audio = document.getElementById('bgm-player');
+    audio.src = url;
+    audio.volume = 0;
+    audio.play().catch(()=>{});
+    currentBgmUrl = url;
+    
+    let vol = 0;
+    let fadeIn = setInterval(() => {
+        vol += 0.1;
+        if (vol >= 0.8) {
+            vol = 0.8;
+            clearInterval(fadeIn);
+        }
+        audio.volume = vol;
+    }, 30);
 }
 
 // ================= 通知系统 =================
@@ -270,7 +394,6 @@ function handleNotifClick(notifId, storyId) {
     if (storyId) location.hash = `#detail/${storyId}`;
 }
 
-// ================= 关注/粉丝列表 =================
 async function openFollowList(type) {
     if (!currentUser) return showToast("请先登录");
     if (!supabaseClient) return showToast("云端未连接");
@@ -281,7 +404,6 @@ async function openFollowList(type) {
     if (!targetId) return;
 
     showToast("加载中...");
-
     let ids = [];
     try {
         if (type === 'following') {
@@ -340,7 +462,6 @@ async function openFollowList(type) {
     document.getElementById('modal-overlay').classList.add('active');
 }
 
-// ================= 作者显示 =================
 function displayAuthorOf(story) {
     if (story && story.user_id && globalProfilesCache[story.user_id] && globalProfilesCache[story.user_id].username) {
         const p = globalProfilesCache[story.user_id];
@@ -349,7 +470,7 @@ function displayAuthorOf(story) {
     return { name: (story && story.author) || '未知', avatar: (story && story.author_avatar) || DEFAULT_AVATAR };
 }
 
-// ================= 初始化 =================
+// ================= 初始化与账号 =================
 function initApp() {
     const statusEl = document.getElementById('cloud-status');
     let raw = safeGetLocal('vn_stories');
@@ -408,17 +529,12 @@ async function checkSession() {
         updateAuthUI();
         syncOwnStoriesAuthor();
         await pullFromCloud();
-
-        if (currentUser && (!globalProfilesCache[currentUser.id] || !globalProfilesCache[currentUser.id].username)) {
-            openProfileModal(true);
-        }
     } catch(e) {
         const statusEl = document.getElementById('cloud-status');
         if(statusEl) statusEl.innerText = '🔴 连接失败';
     }
 }
 
-// ================= 账号系统 =================
 function openAuthModal() { const el = document.getElementById('auth-overlay'); if(el) el.classList.add('active'); }
 
 async function handleAuth(type) {
@@ -457,11 +573,6 @@ async function handleAuth(type) {
         else if (msg.includes('Invalid login credentials')) showToast("❌ 邮箱或密码错误，或账号尚未注册");
         else if (msg.includes('Email not confirmed')) showToast("❌ 邮箱尚未验证，请先到邮箱点击验证链接");
         else if (msg.includes('already registered') || msg.includes('User already registered')) showToast("❌ 该邮箱已注册，请直接登录");
-        else if (msg.includes('Password should be at least')) showToast("❌ 密码太短，请使用至少 6 位密码");
-        else if (msg.includes('Signups not allowed')) showToast("❌ 该站点已关闭注册功能");
-        else if (msg.includes('rate limit') || msg.includes('Email rate')) showToast("❌ 操作过于频繁，请稍后再试");
-        else if (msg.includes('Unable to validate email')) showToast("❌ 邮箱格式不正确");
-        else if (msg.includes('Error sending confirmation email')) showToast("❌ 验证邮件发送失败，请稍后重试");
         else showToast("❌ 操作失败：" + msg);
     }
 }
@@ -556,7 +667,10 @@ async function saveProfile() {
                 id: currentUser.id, username: newName, avatar_url: newAvatar, bio: newBio, updated_at: new Date().toISOString()
             });
             if (error) throw error;
-            globalProfilesCache[currentUser.id] = { username: newName, avatar_url: newAvatar, bio: newBio };
+            globalProfilesCache[currentUser.id] = globalProfilesCache[currentUser.id] || {};
+            globalProfilesCache[currentUser.id].username = newName;
+            globalProfilesCache[currentUser.id].avatar_url = newAvatar;
+            globalProfilesCache[currentUser.id].bio = newBio;
             showToast("资料已保存");
             document.getElementById('profile-overlay').classList.remove('active');
         } catch (e) {
@@ -631,77 +745,47 @@ async function renderProfilePage() {
         </div>
     `).join('') || '<div style="color:#888;">暂无作品</div>';
 
-    // 最近观看
+    // 最近观看记录
     const recentSection = document.getElementById('prof-recent-section');
     const recentList = document.getElementById('prof-recent-list');
     if (recentSection && recentList) {
+        let recentViews = [];
         if (isMe) {
-            const pts = getResumePoints();
-            const recent = Object.entries(pts)
-                .map(([id, rp]) => {
-                    const story = getStories().find(s => s.id === id);
-                    return (story && rp && rp.chapterId && rp.timestamp) ? { id, rp, story } : null;
-                })
-                .filter(Boolean)
-                .sort((a, b) => (b.rp.timestamp || 0) - (a.rp.timestamp || 0))
-                .slice(0, 12);
-            if (recent.length > 0) {
-                recentSection.style.display = 'block';
-                recentList.innerHTML = recent.map(({id, rp, story}) => `
-                    <div class="story-card" onclick="resumeFromProfile('${id}')" style="position:relative;">
-                        <img src="${story.cover || 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop'}">
-                        <div class="card-info">
-                            <h3 style="font-size:1rem;">${escapeHtml(story.title)}</h3>
-                            <p style="color:#c0a062; font-size:0.8rem;">📖 ${escapeHtml(rp.chapterTitle || '未知章节')}</p>
-                            <p style="color:#666; font-size:0.7rem; margin-top:4px;">${formatTime(rp.timestamp)}</p>
-                        </div>
-                    </div>
-                `).join('');
-            } else {
-                recentSection.style.display = 'none';
+            const prof = globalProfilesCache[targetId] || {};
+            if (Array.isArray(prof.recent_views)) recentViews = prof.recent_views;
+            else {
+                const pts = getResumePoints();
+                recentViews = Object.entries(pts).map(([id, rp]) => ({
+                    storyId: id, chapterId: rp.chapterId, chapterTitle: rp.chapterTitle, timestamp: rp.timestamp
+                }));
             }
+        } else {
+            const prof = globalProfilesCache[targetId] || {};
+            if (Array.isArray(prof.recent_views)) recentViews = prof.recent_views;
+        }
+
+        recentViews = recentViews.filter(rv => rv && rv.storyId).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, 12);
+
+        if (recentViews.length > 0) {
+            recentSection.style.display = 'block';
+            recentList.innerHTML = recentViews.map(rp => {
+                const story = getStories().find(s => s.id === rp.storyId);
+                if (!story) return ''; 
+                return `
+                <div class="story-card" onclick="resumeFromProfile('${rp.storyId}')" style="position:relative;">
+                    <img src="${story.cover || 'https://images.unsplash.com/photo-1605806616949-1e87b487cb2a?q=80&w=800&auto=format&fit=crop'}">
+                    <div class="card-info">
+                        <h3 style="font-size:1rem;">${escapeHtml(story.title)}</h3>
+                        <p style="color:#c0a062; font-size:0.8rem;">📖 ${escapeHtml(rp.chapterTitle || '未知章节')}</p>
+                        <p style="color:#666; font-size:0.7rem; margin-top:4px;">${formatTime(rp.timestamp)}</p>
+                    </div>
+                </div>
+                `;
+            }).join('');
         } else {
             recentSection.style.display = 'none';
         }
     }
-
-    if (supabaseClient) {
-        try {
-            const { count: f1 } = await supabaseClient.from('follows').select('*', { count: 'exact', head: true }).eq('follower_id', targetId);
-            const { count: f2 } = await supabaseClient.from('follows').select('*', { count: 'exact', head: true }).eq('following_id', targetId);
-            document.getElementById('prof-following').innerText = f1 || 0;
-            document.getElementById('prof-followers').innerText = f2 || 0;
-
-            if (!isMe && currentUser) {
-                const { data } = await supabaseClient.from('follows').select('*').eq('follower_id', currentUser.id).eq('following_id', targetId).maybeSingle();
-                document.getElementById('btn-follow').innerText = data ? '取消关注' : '关注';
-            }
-        } catch(e) {}
-    }
-}
-
-function resumeFromProfile(storyId) {
-    const pts = getResumePoints();
-    const rp = pts[storyId];
-    if (!rp || !rp.chapterId || !rp.nodeId) {
-        location.hash = `#detail/${storyId}`;
-        return;
-    }
-    window._pendingResume = rp;
-    location.hash = `#play/${storyId}/${rp.chapterId}`;
-}
-
-async function toggleFollow() {
-    if(!currentUser) return showToast("请先登录");
-    const parts = window.location.hash.split('/');
-    let targetId = parts[1];
-    if (targetId === 'me') targetId = currentUser.id;
-    const btn = document.getElementById('btn-follow');
-    const isFollowing = btn.innerText === '取消关注';
-
-    if (isFollowing) { await supabaseClient.from('follows').delete().eq('follower_id', currentUser.id).eq('following_id', targetId); showToast("已取消"); }
-    else { await supabaseClient.from('follows').insert({ follower_id: currentUser.id, following_id: targetId }); showToast("已关注"); }
-    renderProfilePage();
 }
 
 // ================= 云端同步 =================
@@ -764,15 +848,18 @@ async function uploadToCloud(storyId) {
 }
 
 // ================= 路由与核心 =================
-let currentManageId = null, currentChapterId = null, currentDetailStory = null;
-let _lastRoutedHash = '';
-
 function router() {
     const hash = window.location.hash || '#workspace';
     window._prevHash = _lastRoutedHash;
     _lastRoutedHash = hash;
 
     const parts = hash.split('/');
+    
+    // 只要不是播放器页面，强制停止BGM
+    if (parts[0] !== '#play') {
+        stopBgmForce();
+    }
+
     document.querySelectorAll('.view').forEach(v => { v.classList.remove('active'); v.style.display = 'none'; });
     const showView = (id) => { const el = document.getElementById(id); if (el) { el.classList.add('active'); el.style.display = 'block'; window.scrollTo(0, 0); } };
 
@@ -806,7 +893,6 @@ function router() {
 window.addEventListener('hashchange', router); window.addEventListener('load', initApp);
 
 // ================= 工作台与广场 =================
-let toastTimer;
 function showToast(msg) { const t = document.getElementById('toast'); if(!t) return; document.getElementById('toast-text').innerText = msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 3000); }
 
 function openModal(title, html, cb) {
@@ -827,9 +913,6 @@ function openModal(title, html, cb) {
     };
 }
 function closeModal() { document.getElementById('modal-overlay').classList.remove('active'); }
-
-let confirmCallback = null;
-let confirmCancelCallback = null;
 
 function showConfirm(title, msg, cb, cancelCb) { 
     document.getElementById('confirm-title').innerText = title; 
@@ -1005,7 +1088,6 @@ function deleteItem(type, id) {
 }
 
 // ================= 角色立绘管理 =================
-let currentSpriteCharId = null;
 function openSpriteManager(charId) { currentSpriteCharId = charId; renderSpriteManager(); }
 
 function renderSpriteManager() {
@@ -1224,13 +1306,18 @@ function renderDetail(id) {
 }
 
 function startStoryFromDetail(story) {
+    window._isPreview = false;
     const chapters = story.chapters || [];
     if (chapters.length === 0) { showToast("作者还没写呢！"); return; }
 
     const pts = getResumePoints();
     const rp = pts[story.id];
 
-    if (!rp || !rp.chapterId || !rp.nodeId) { startFresh(story.id); return; }
+    if (!rp || !rp.chapterId || !rp.nodeId) { 
+        window._pendingResume = null;
+        location.hash = `#play/${story.id}/${chapters[0].id}`;
+        return; 
+    }
 
     const chapter = chapters.find(c => c.id === rp.chapterId);
     let isAtEnd = false;
@@ -1241,12 +1328,11 @@ function startStoryFromDetail(story) {
 
     const chapterTitle = (chapter || {}).title || '未知章节';
     
-    // 检测到上次看的是结局
     if (isAtEnd) {
         if (rp.lastBranchNodeId) {
             showConfirm(
                 "上次已看完结局",
-                `检测到你上次已经看完了《${chapterTitle}》的结局。\n\n点「确定」回到本章最后一个选择点重新选择\n点「取消」从头开始阅读本章`,
+                `检测到你上次已经看完了《${chapterTitle}》的结局。\n\n点「确定」回到本章最后一个选择点重新选择\n点「取消」留在当前页面\n\n（若想从头看，请点击旁边的【目录】重新选择章节）`,
                 () => {
                     rp.nodeId = rp.lastBranchNodeId;
                     rp.vars = rp.lastBranchVars ? [...rp.lastBranchVars] : [];
@@ -1256,6 +1342,13 @@ function startStoryFromDetail(story) {
                     window._pendingResume = rp;
                     location.hash = `#play/${story.id}/${rp.chapterId}`;
                 },
+                () => {}
+            );
+            return;
+        } else {
+            showConfirm(
+                "上次已看完结局",
+                `检测到你上次已经看完了《${chapterTitle}》的结局。\n\n点「确定」从本章开头重新阅读\n点「取消」留在当前页面`,
                 () => {
                     rp.nodeId = null;
                     delete rp.lastBranchNodeId;
@@ -1263,38 +1356,22 @@ function startStoryFromDetail(story) {
                     safeSetLocal('vn_resume_points', JSON.stringify(pts));
                     window._pendingResume = rp;
                     location.hash = `#play/${story.id}/${rp.chapterId}`;
-                }
+                },
+                () => {}
             );
-            return;
-        } else {
-            showToast("上次已看完本章，即将从头开始");
-            window._pendingResume = null;
-            location.hash = `#play/${story.id}/${rp.chapterId}`;
             return;
         }
     }
 
-    // 普通进度继续
     showConfirm(
         "继续阅读？",
-        `检测到上次读到《${chapterTitle}》\n\n点「确定」从上次位置继续\n点「取消」从头开始观看`,
+        `检测到上次读到《${chapterTitle}》\n\n点「确定」从上次位置继续\n点「取消」留在当前页面\n\n（若想从头看，请点击旁边的【目录】重新选择章节）`,
         () => {
             window._pendingResume = rp;
             location.hash = `#play/${story.id}/${rp.chapterId}`;
         },
-        () => { startFresh(story.id); }
+        () => {}
     );
-}
-
-function startFresh(storyId) {
-    clearResumePoint(storyId);
-    clearPlayState(storyId);
-    window._pendingResume = null;
-    const story = getStories().find(x => x.id === storyId);
-    if (!story) return;
-    const chapters = story.chapters || [];
-    if (chapters.length === 0) return;
-    location.hash = `#play/${storyId}/${chapters[0].id}`;
 }
 
 function openChapterList(story) {
@@ -1332,13 +1409,14 @@ function openChapterList(story) {
 
 function jumpToChapter(storyId, chapterId) {
     closeModal();
-    const pts = getResumePoints();
-    const rp = pts[storyId];
-    if (rp && rp.chapterId === chapterId && rp.nodeId) {
-        window._pendingResume = rp;
-    } else {
-        window._pendingResume = null;
-    }
+    window._pendingResume = null;
+    window._isPreview = false;
+    
+    // 【核心修复】每次从目录点进去，彻底清空所有存档和变量！
+    currentVars = [];
+    clearPlayState(storyId);
+    clearResumePoint(storyId);
+
     location.hash = `#play/${storyId}/${chapterId}`;
 }
 
@@ -1372,6 +1450,31 @@ document.addEventListener('click', function(e) {
         if (!e.target.closest('.map-pin-detail')) tooltip.style.display = 'none';
     }
 });
+
+function resumeFromProfile(storyId) {
+    window._isPreview = false; 
+    const pts = getResumePoints();
+    const rp = pts[storyId];
+    if (!rp || !rp.chapterId || !rp.nodeId) {
+        location.hash = `#detail/${storyId}`;
+        return;
+    }
+    window._pendingResume = rp;
+    location.hash = `#play/${storyId}/${rp.chapterId}`;
+}
+
+async function toggleFollow() {
+    if(!currentUser) return showToast("请先登录");
+    const parts = window.location.hash.split('/');
+    let targetId = parts[1];
+    if (targetId === 'me') targetId = currentUser.id;
+    const btn = document.getElementById('btn-follow');
+    const isFollowing = btn.innerText === '取消关注';
+
+    if (isFollowing) { await supabaseClient.from('follows').delete().eq('follower_id', currentUser.id).eq('following_id', targetId); showToast("已取消"); }
+    else { await supabaseClient.from('follows').insert({ follower_id: currentUser.id, following_id: targetId }); showToast("已关注"); }
+    renderProfilePage();
+}
 
 // ================= 节点编辑器 =================
 function renderNodeEditor() {
@@ -1777,7 +1880,7 @@ function editNode(id) {
             const newOpts = [];
             rows.forEach(row => {
                 const t = row.querySelector('.opt-text').value.trim();
-                const r = row.querySelector('.opt-req').value.trim();
+                const r = row.querySelector('.opt-req') ? row.querySelector('.opt-req').value.trim() : '';
                 const next = row.querySelector('.opt-next') ? row.querySelector('.opt-next').value.trim() : '';
                 if (t) newOpts.push({ text: t, reqVars: r, nextEntry: next });
             });
@@ -1866,7 +1969,6 @@ function autoLayout() {
     }
     if (!Array.isArray(ch.edges)) ch.edges = [];
 
-    // 单节点：直接放到标准位置
     if (ch.nodes.length === 1) {
         ch.nodes[0].x = 100;
         ch.nodes[0].y = 150;
@@ -1876,7 +1978,6 @@ function autoLayout() {
         return;
     }
 
-    // ===== 1. 建立邻接表 / 入度 / 父节点表 =====
     const nodeIds = new Set(ch.nodes.map(n => n.id));
     const adj = {}, inDeg = {}, parentsOf = {};
     ch.nodes.forEach(n => { adj[n.id] = []; inDeg[n.id] = 0; parentsOf[n.id] = []; });
@@ -1889,7 +1990,6 @@ function autoLayout() {
         parentsOf[e.to].push(e.from);
     });
 
-    // ===== 2. Kahn 拓扑排序（检测环） =====
     const q = ch.nodes.filter(n => inDeg[n.id] === 0).map(n => n.id);
     const topo = [];
     const queueCopy = [...q];
@@ -1903,7 +2003,6 @@ function autoLayout() {
         });
     }
 
-    // ===== 3. 最长路径 DP 计算层级 =====
     const level = {};
     ch.nodes.forEach(n => level[n.id] = 0);
     topo.forEach(id => {
@@ -1913,7 +2012,6 @@ function autoLayout() {
         });
     });
 
-    // 环上节点 → 强行放到最右边
     const reachedSet = new Set(topo);
     const unreached = ch.nodes.filter(n => !reachedSet.has(n.id));
     if (unreached.length > 0) {
@@ -1930,7 +2028,6 @@ function autoLayout() {
         });
     }
 
-    // ===== 4. 分组 =====
     const groups = {};
     ch.nodes.forEach(n => {
         const l = level[n.id];
@@ -1939,7 +2036,6 @@ function autoLayout() {
     });
     const sortedLevels = Object.keys(groups).map(Number).sort((a, b) => a - b);
 
-    // ===== 5. 逐层布局（重心排序） =====
     const gapX = 320, gapY = 140, startX = 100, startY = 100;
     const maxInLevel = Math.max(...sortedLevels.map(l => groups[l].length));
     const centerY = startY + (maxInLevel - 1) * gapY / 2;
@@ -1951,7 +2047,6 @@ function autoLayout() {
 
     sortedLevels.forEach((l, idx) => {
         const nodes = groups[l];
-
         if (idx === 0) {
             nodes.sort((a, b) => {
                 const ya = Number(a.y) || 0, yb = Number(b.y) || 0;
@@ -1983,7 +2078,6 @@ function autoLayout() {
         });
     });
 
-    // ===== 6. 更新画布尺寸 =====
     let maxX = 0, maxY = 0;
     ch.nodes.forEach(n => {
         const ex = (n.x || 0) + 260;
@@ -2009,7 +2103,7 @@ function autoLayout() {
     showToast("✨ 排版完成");
 }
 
-// ================= 新建章节/角色/地点/词条/关系 =================
+// ================= 新建与管理 =================
 function openAddChapterModal() {
     openModal("新章节", `<input type="text" id="m-ch-title" placeholder="标题">`, () => {
         const t = document.getElementById('m-ch-title').value;
@@ -2023,82 +2117,57 @@ function openAddChapterModal() {
 }
 
 function openAddCharacterModal() {
-    openModal("新角色",
-        `<input type="text" id="m-c-name" placeholder="名字">
-         <textarea id="m-c-desc" rows="3" placeholder="简介" style="margin-top:10px;"></textarea>`,
-        () => {
-            const n = document.getElementById('m-c-name').value;
-            if(!n) return;
-            const s = getStories().find(x => x.id === currentManageId);
-            if(!s.characters) s.characters = [];
-            s.characters.push({ id: 'char_' + Date.now(), name: n, desc: document.getElementById('m-c-desc').value, sprites: [] });
-            saveStories(getStories());
-            renderManageSubPage('characters');
-        }
-    );
+    openModal("新角色", `<input type="text" id="m-c-name" placeholder="名字"><textarea id="m-c-desc" rows="3" placeholder="简介" style="margin-top:10px;"></textarea>`, () => {
+        const n = document.getElementById('m-c-name').value;
+        if(!n) return;
+        const s = getStories().find(x => x.id === currentManageId);
+        if(!s.characters) s.characters = [];
+        s.characters.push({ id: 'char_' + Date.now(), name: n, desc: document.getElementById('m-c-desc').value, sprites: [] });
+        saveStories(getStories());
+        renderManageSubPage('characters');
+    });
 }
 
 function openAddPlotModal() {
-    openModal("新地点",
-        `<input type="text" id="m-p-title" placeholder="名称">
-         <textarea id="m-p-desc" rows="3" placeholder="描述" style="margin-top:10px;"></textarea>`,
-        () => {
-            const t = document.getElementById('m-p-title').value;
-            if(!t) return;
-            const s = getStories().find(x => x.id === currentManageId);
-            if(!s.plots) s.plots = [];
-            s.plots.push({ id: 'plot_' + Date.now(), title: t, desc: document.getElementById('m-p-desc').value, x: 50, y: 50 });
-            saveStories(getStories());
-            renderManageSubPage('plots');
-        }
-    );
+    openModal("新地点", `<input type="text" id="m-p-title" placeholder="名称"><textarea id="m-p-desc" rows="3" placeholder="描述" style="margin-top:10px;"></textarea>`, () => {
+        const t = document.getElementById('m-p-title').value;
+        if(!t) return;
+        const s = getStories().find(x => x.id === currentManageId);
+        if(!s.plots) s.plots = [];
+        s.plots.push({ id: 'plot_' + Date.now(), title: t, desc: document.getElementById('m-p-desc').value, x: 50, y: 50 });
+        saveStories(getStories());
+        renderManageSubPage('plots');
+    });
 }
 
 function openAddWikiModal() {
     const s = getStories().find(x => x.id === currentManageId);
     const chapterOpts = (s.chapters || []).map(c=>`<option value="${c.id}">读完 ${escapeHtml(c.title)} 解锁</option>`).join('');
-    openModal("新词条",
-        `<input type="text" id="m-w-term" placeholder="词条名">
-         <textarea id="m-w-content" rows="3" placeholder="内容" style="margin-top:10px;"></textarea>
-         <select id="m-w-unlock" style="margin-top:10px;width:100%;padding:5px;">
-             <option value="">所有人可见</option>${chapterOpts}
-         </select>`,
-        () => {
-            const t = document.getElementById('m-w-term').value;
-            if(!t) return;
-            if(!s.wiki) s.wiki = [];
-            s.wiki.push({
-                id: 'wiki_' + Date.now(),
-                term: t,
-                content: document.getElementById('m-w-content').value,
-                unlockChapter: document.getElementById('m-w-unlock').value
-            });
-            saveStories(getStories());
-            renderManageSubPage('wiki');
-        }
-    );
+    openModal("新词条", `<input type="text" id="m-w-term" placeholder="词条名"><textarea id="m-w-content" rows="3" placeholder="内容" style="margin-top:10px;"></textarea><select id="m-w-unlock" style="margin-top:10px;width:100%;padding:5px;"><option value="">所有人可见</option>${chapterOpts}</select>`, () => {
+        const t = document.getElementById('m-w-term').value;
+        if(!t) return;
+        if(!s.wiki) s.wiki = [];
+        s.wiki.push({ id: 'wiki_' + Date.now(), term: t, content: document.getElementById('m-w-content').value, unlockChapter: document.getElementById('m-w-unlock').value });
+        saveStories(getStories());
+        renderManageSubPage('wiki');
+    });
 }
 
 function openAddRelationshipModal() {
     const s = getStories().find(x=>x.id===currentManageId);
     if(!s.characters || s.characters.length < 2) return showToast("需要至少2个角色");
     const opts = s.characters.map(c=>`<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
-    openModal("添加关系",
-        `<div class="form-group"><label>A</label><select id="m-rel-from">${opts}</select></div>
-         <div class="form-group"><label>B</label><select id="m-rel-to">${opts}</select></div>
-         <div class="form-group"><label>标签</label><input type="text" id="m-rel-label"></div>`,
-        () => {
-            const f = document.getElementById('m-rel-from').value;
-            const t = document.getElementById('m-rel-to').value;
-            const l = document.getElementById('m-rel-label').value;
-            if(f===t || !l) return;
-            if(!s.relationships) s.relationships = [];
-            s.relationships = s.relationships.filter(r => !(r.from === f && r.to === t) && !(r.from === t && r.to === f));
-            s.relationships.push({ from: f, to: t, label: l });
-            saveStories(getStories());
-            switchCharTab('graph');
-        }
-    );
+    openModal("添加关系", `<div class="form-group"><label>A</label><select id="m-rel-from">${opts}</select></div><div class="form-group"><label>B</label><select id="m-rel-to">${opts}</select></div><div class="form-group"><label>标签</label><input type="text" id="m-rel-label"></div>`, () => {
+        const f = document.getElementById('m-rel-from').value;
+        const t = document.getElementById('m-rel-to').value;
+        const l = document.getElementById('m-rel-label').value;
+        if(f===t || !l) return;
+        if(!s.relationships) s.relationships = [];
+        s.relationships = s.relationships.filter(r => !(r.from === f && r.to === t) && !(r.from === t && r.to === f));
+        s.relationships.push({ from: f, to: t, label: l });
+        saveStories(getStories());
+        switchCharTab('graph');
+    });
 }
 
 function saveStoryInfo() {
@@ -2181,7 +2250,7 @@ function importData(e) {
     r.readAsText(f);
 }
 
-// ================= 预览入口 =================
+// ================= 预览 =================
 function previewChapter() {
     if (!currentManageId || !currentChapterId) return;
     const story = getStories().find(s => s.id === currentManageId);
@@ -2189,7 +2258,6 @@ function previewChapter() {
     const chapter = (story.chapters || []).find(c => c.id === currentChapterId);
     if (!chapter) return;
 
-    // 收集本章所有入口：所有 start 节点 + 所有带 entryKey 的 dialogue/narration
     const entries = [];
     (chapter.nodes || []).forEach(n => {
         if (!n || !n.type) return;
@@ -2210,7 +2278,6 @@ function previewChapter() {
         }
     });
 
-    // 无入口兜底
     if (entries.length === 0) {
         if (!chapter.nodes || chapter.nodes.length === 0) {
             return showToast("本章还没有节点，无法预览");
@@ -2219,13 +2286,11 @@ function previewChapter() {
         return;
     }
 
-    // 只有一个入口：直接预览
     if (entries.length === 1) {
         _startPreviewWith(entries[0].nodeId);
         return;
     }
 
-    // 多个入口：弹窗让作者选择
     let html = `
         <p style="color:#c0a062; font-size:0.85rem; margin-bottom:15px; line-height:1.6;">
             💡 本章有 <b>${entries.length}</b> 个可能的入口（多个开始节点，或带入口标签的节点）。
@@ -2266,9 +2331,6 @@ function startPreviewFrom(nodeId) {
 }
 
 // ================= 播放器核心 =================
-let currNodeId = null, isTyping = false, typeTimer = null, chIdx = 0, txt = "", hist = [], isAuto = false, isSkip = false, autoT = null, skipT = null, playStoryId = null, playChap = null;
-let currentVars = [];
-
 function startPlayer(sid, cid) {
     playStoryId = sid;
     const s = getStories().find(x => x.id === sid);
@@ -2276,10 +2338,13 @@ function startPlayer(sid, cid) {
     playChap = (s.chapters || []).find(x => x.id === cid);
     if (!playChap) { showToast("章节不存在"); location.hash = `#detail/${sid}`; return; }
 
+    if (!window._pendingResume) {
+        window._isPreview = false;
+    }
+
     document.getElementById('bg-layer').style.backgroundImage = s.bg ? `url('${s.bg}')` : 'none';
     ['left', 'center', 'right'].forEach(pos => { const f = document.getElementById('figure-layer-' + pos); if (f) { f.style.display = 'none'; f.src = ''; } });
-    const bgmEl = document.getElementById('bgm-player');
-    bgmEl.pause(); bgmEl.src = '';
+    stopBgmForce();
 
     document.getElementById('choices-container').style.display = 'none';
     hist = []; updateHist();
@@ -2288,7 +2353,6 @@ function startPlayer(sid, cid) {
     document.getElementById('btn-auto').style.color = '#fff';
     document.getElementById('btn-skip').style.color = '#fff';
 
-    // ===== 预览分支 =====
     if (window._isPreview) {
         currentVars = [];
         const previewEntryId = window._previewEntryNodeId;
@@ -2313,45 +2377,56 @@ function startPlayer(sid, cid) {
         return;
     }
 
-    // ===== 正常游戏分支 =====
-    const ps = loadPlayState(sid);
-    const rp = window._pendingResume;
-    window._pendingResume = null;
-
     let chosen = null;
+    const ps = loadPlayState(sid);
 
-    if (rp && rp.chapterId === cid && rp.nodeId) {
-        currentVars = Array.isArray(rp.vars) ? [...rp.vars] : [];
-        ps.pendingEntry = rp.pendingEntry || '';
-        ps.vars = [...currentVars];
-        savePlayState(sid, ps);
-
-        chosen = (playChap.nodes || []).find(n => n.id === rp.nodeId) || null;
-
-        if (chosen) {
-            const bgLayer = document.getElementById('bg-layer');
-            if (bgLayer) {
-                bgLayer.style.backgroundImage = rp.bgImage || (s.bg ? `url('${s.bg}')` : 'none');
-            }
-            ['left', 'center', 'right'].forEach(pos => {
-                const f = document.getElementById('figure-layer-' + pos);
-                if (!f) return;
-                const val = rp.figures ? rp.figures[pos] : null;
-                if (val) { f.src = val; f.style.display = 'block'; }
-                else { f.style.display = 'none'; }
-            });
-            if (rp.bgm) {
-                bgmEl.src = rp.bgm;
-                bgmEl.play().catch(() => {});
-            }
+    if (window._forceEntry) {
+        window._forceEntry = false;
+        window._pendingResume = null;
+        currentVars = Array.isArray(ps.vars) ? [...ps.vars] : [];
+        
+        if (ps.pendingEntry) {
+            chosen = (playChap.nodes || []).find(n => (n.entryKey || '') === ps.pendingEntry) || null;
         }
     } else {
-        currentVars = Array.isArray(ps.vars) ? [...ps.vars] : [];
+        const rp = window._pendingResume;
+        window._pendingResume = null;
+
+        if (rp && rp.chapterId === cid && rp.nodeId) {
+            currentVars = Array.isArray(rp.vars) ? [...rp.vars] : [];
+            ps.pendingEntry = rp.pendingEntry || '';
+            ps.vars = [...currentVars];
+            savePlayState(sid, ps);
+            chosen = (playChap.nodes || []).find(n => n.id === rp.nodeId) || null;
+
+            if (chosen) {
+                const bgLayer = document.getElementById('bg-layer');
+                if (bgLayer) bgLayer.style.backgroundImage = rp.bgImage || (s.bg ? `url('${s.bg}')` : 'none');
+                
+                ['left', 'center', 'right'].forEach(pos => {
+                    const f = document.getElementById('figure-layer-' + pos);
+                    if (!f) return;
+                    const val = rp.figures ? rp.figures[pos] : null;
+                    if (val) { f.src = val; f.style.display = 'block'; }
+                    else { f.style.display = 'none'; }
+                });
+                if (rp.bgm) {
+                    playBgmWithFade(rp.bgm);
+                }
+            }
+        } else {
+            // 【核心修复】如果没有断点也没有强制跨章，绝不继承任何变量！
+            currentVars = []; 
+            ps.vars = [];
+            ps.pendingEntry = '';
+            savePlayState(sid, ps);
+
+            if (ps.pendingEntry) {
+                chosen = (playChap.nodes || []).find(n => (n.entryKey || '') === ps.pendingEntry) || null;
+            }
+        }
     }
 
-    if (!chosen && ps.pendingEntry) {
-        chosen = (playChap.nodes || []).find(n => (n.entryKey || '') === ps.pendingEntry) || null;
-    }
     if (!chosen) {
         const startNodes = (playChap.nodes || []).filter(n => n.type === 'start');
         chosen = startNodes.find(n => !n.entryKey) || startNodes[0] || null;
@@ -2382,16 +2457,19 @@ function processNode() {
     }
 
     if (n.type === 'bgm') {
-        const a = document.getElementById('bgm-player');
-        if(n.bgm) { a.src = n.bgm; a.play().catch(()=>{}); }
-        else { a.pause(); a.src = ''; }
+        playBgmWithFade(n.bgm || '');
         nextNode(); return;
     }
 
     if (n.type === 'illustration') {
         const bg = document.getElementById('bg-layer');
-        if (n.hide) { bg.style.backgroundImage = 'none'; }
-        else if (n.img) { bg.style.backgroundImage = `url('${n.img}')`; }
+        if (n.hide) {
+            bg.style.opacity = 0;
+            setTimeout(() => { bg.style.backgroundImage = 'none'; bg.style.opacity = 1; }, 400);
+        } else if (n.img) {
+            bg.style.opacity = 0;
+            setTimeout(() => { bg.style.backgroundImage = `url('${n.img}')`; bg.style.opacity = 1; }, 400);
+        }
         nextNode(); return;
     }
 
@@ -2403,15 +2481,22 @@ function processNode() {
         let pos = n.pos || (n.hide ? 'all' : 'center');
 
         if (action === 'hide') {
-            if (pos === 'all' || pos === 'left') { if(fLeft) fLeft.style.display = 'none'; }
-            if (pos === 'all' || pos === 'center') { if(fCenter) fCenter.style.display = 'none'; }
-            if (pos === 'all' || pos === 'right') { if(fRight) fRight.style.display = 'none'; }
+            if (pos === 'all' || pos === 'left') { if(fLeft) { fLeft.style.opacity = 0; setTimeout(() => fLeft.style.display = 'none', 400); } }
+            if (pos === 'all' || pos === 'center') { if(fCenter) { fCenter.style.opacity = 0; setTimeout(() => fCenter.style.display = 'none', 400); } }
+            if (pos === 'all' || pos === 'right') { if(fRight) { fRight.style.opacity = 0; setTimeout(() => fRight.style.display = 'none', 400); } }
         } else {
             let targetEl = fCenter;
             if (pos === 'left') targetEl = fLeft;
             if (pos === 'right') targetEl = fRight;
             if (targetEl) {
-                if (n.img) { targetEl.src = n.img; targetEl.style.display = 'block'; } else { targetEl.style.display = 'none'; }
+                if (n.img) {
+                    targetEl.src = n.img;
+                    targetEl.style.display = 'block';
+                    targetEl.style.opacity = 0;
+                    setTimeout(() => targetEl.style.opacity = 1, 50);
+                } else {
+                    targetEl.style.display = 'none';
+                }
             }
         }
         nextNode(); return;
@@ -2512,18 +2597,30 @@ function updateHist() {
 function toggleHistory() { document.getElementById('history-panel').classList.toggle('open'); }
 
 function showChoices(eds, branchNode) {
+    clearTimeout(autoT);
+    clearTimeout(skipT);
+    if (isAuto) { isAuto = false; document.getElementById('btn-auto').style.color = '#fff'; }
+    if (isSkip) { isSkip = false; document.getElementById('btn-skip').style.color = '#fff'; }
+
     document.getElementById('textbox-container').style.display = 'none';
     const c = document.getElementById('choices-container');
     c.innerHTML = '';
 
     const validEds = eds.filter(ed => {
-        if (ed.branchIndex === undefined) return true;
+        // 【核心修复】如果连线没有指定 branchIndex，说明没和端口绑定，直接丢弃！绝不让它露出来！
+        if (ed.branchIndex === undefined) return false; 
+        
         const opt = branchNode.options[ed.branchIndex];
         if (!opt) return false;
-        if (window._isPreview) return true;
+        
         const reqs = splitConditions(opt.reqVars);
         if (reqs.length === 0) return true;
-        return reqs.every(r => currentVars.includes(r));
+        
+        // 严格校验条件，缺一个都不行
+        for (let r of reqs) {
+            if (!currentVars.includes(r)) return false; 
+        }
+        return true;
     });
 
     if (validEds.length === 0) {
@@ -2538,35 +2635,22 @@ function showChoices(eds, branchNode) {
     validEds.forEach((ed, i) => {
         const btn = document.createElement('button');
         btn.className = 'choice-btn';
-        const opt = (branchNode && branchNode.options && ed.branchIndex !== undefined && branchNode.options[ed.branchIndex]) ? branchNode.options[ed.branchIndex] : null;
-
-        let label = opt ? opt.text : `选项 ${i+1}`;
-        if (window._isPreview && opt && opt.reqVars) {
-            const reqs = splitConditions(opt.reqVars);
-            const missing = reqs.filter(r => !currentVars.includes(r));
-            if (missing.length > 0) {
-                label += `  ⚠️ [预览中，实际需: ${missing.join('、')}]`;
-            } else if (reqs.length > 0) {
-                label += `  ✅ [条件已满足]`;
-            }
-        }
-        btn.innerText = label;
+        const opt = branchNode.options[ed.branchIndex];
+        btn.innerText = opt.text;
 
         btn.onclick = () => {
             if (!window._isPreview) {
-                // 记录历史选择
                 const history = getBranchHistory(playStoryId);
                 history.push({
                     chapterId: playChap.id,
                     chapterTitle: playChap.title || '未命名章节',
                     nodeId: currNodeId,
                     varsBefore: [...currentVars],
-                    chosenText: opt ? opt.text : '未知选项',
+                    chosenText: opt.text,
                     timestamp: Date.now()
                 });
                 saveBranchHistory(playStoryId, history);
                 
-                // 兼容之前的断点，记录最后一次分支
                 const pts = getResumePoints();
                 if (pts[playStoryId]) {
                     pts[playStoryId].lastBranchNodeId = currNodeId;
@@ -2574,7 +2658,7 @@ function showChoices(eds, branchNode) {
                     safeSetLocal('vn_resume_points', JSON.stringify(pts));
                 }
 
-                if (opt && opt.nextEntry) {
+                if (opt.nextEntry) {
                     const ps = loadPlayState(playStoryId);
                     ps.pendingEntry = opt.nextEntry;
                     ps.vars = [...currentVars];
@@ -2633,7 +2717,6 @@ function showChapterEnd(t) {
         nb.style.display = 'block'; nb.disabled = true; nb.style.opacity = '0.5'; nb.style.cursor = 'not-allowed';
     }
 
-    // ===== 判断是否显示“剧情回溯”按钮 =====
     const btnRewind = document.getElementById('btn-rewind-branch');
     if (btnRewind) {
         const history = getBranchHistory(playStoryId);
@@ -2644,26 +2727,53 @@ function showChapterEnd(t) {
         }
     }
 }
-    // ===== 新增：判断是否显示“回到选择点”按钮 =====
-    const btnRewind = document.getElementById('btn-rewind-branch');
-    if (btnRewind) {
-        const pts = getResumePoints();
-        const rp = pts[playStoryId];
-        if (rp && rp.lastBranchNodeId && !window._isPreview) {
-            btnRewind.style.display = 'block';
-        } else {
-            btnRewind.style.display = 'none';
-        }
+
+function rewindToHistory(index) {
+    if (!playStoryId) return;
+    const history = getBranchHistory(playStoryId);
+    const h = history[index];
+    if (!h) return;
+
+    closeModal();
+    document.getElementById('chapter-end-overlay').classList.remove('active');
+
+    const newHistory = history.slice(0, index);
+    saveBranchHistory(playStoryId, newHistory);
+
+    const pts = getResumePoints();
+    if (pts[playStoryId]) {
+        pts[playStoryId].lastBranchNodeId = h.nodeId;
+        pts[playStoryId].lastBranchVars = [...h.varsBefore];
+        safeSetLocal('vn_resume_points', JSON.stringify(pts));
     }
 
-// ===== 新增：回到选择点函数 =====
+    if (playChap.id !== h.chapterId) {
+        let ps = loadPlayState(playStoryId);
+        ps.vars = [...h.varsBefore];
+        savePlayState(playStoryId, ps);
+
+        window._pendingResume = {
+            chapterId: h.chapterId,
+            nodeId: h.nodeId,
+            vars: [...h.varsBefore],
+            pendingEntry: ps.pendingEntry || ''
+        };
+        location.hash = `#play/${playStoryId}/${h.chapterId}`;
+    } else {
+        currentVars = [...h.varsBefore];
+        currNodeId = h.nodeId;
+        document.getElementById('textbox-container').style.display = 'none';
+        document.getElementById('choices-container').style.display = 'none';
+        processNode();
+    }
+}
+
 function openBranchHistory() {
     if (!playStoryId) return;
     const history = getBranchHistory(playStoryId);
     if (history.length === 0) return showToast("还没有经历过任何选择点");
 
     let html = '<div style="max-height:60vh; overflow-y:auto; padding-right:5px;">';
-    // 倒序展示，最新的在最上面
     for (let i = history.length - 1; i >= 0; i--) {
         const h = history[i];
         html += `
@@ -2684,68 +2794,25 @@ function openBranchHistory() {
     document.getElementById('modal-overlay').classList.add('active');
 }
 
-function rewindToHistory(index) {
-    if (!playStoryId) return;
-    const history = getBranchHistory(playStoryId);
-    const h = history[index];
-    if (!h) return;
-
-    closeModal();
-    document.getElementById('chapter-end-overlay').classList.remove('active');
-
-    // 截断历史记录（保留到当前重选的前一步）
-    const newHistory = history.slice(0, index);
-    saveBranchHistory(playStoryId, newHistory);
-
-    // 同步清理最后的断点状态
-    const pts = getResumePoints();
-    if (pts[playStoryId]) {
-        pts[playStoryId].lastBranchNodeId = h.nodeId;
-        pts[playStoryId].lastBranchVars = [...h.varsBefore];
-        safeSetLocal('vn_resume_points', JSON.stringify(pts));
-    }
-
-    // 如果是在不同的章节触发的，需要先跨章跳转
-    if (playChap.id !== h.chapterId) {
-        let ps = loadPlayState(playStoryId);
-        ps.vars = [...h.varsBefore];
-        savePlayState(playStoryId, ps);
-
-        window._pendingResume = {
-            chapterId: h.chapterId,
-            nodeId: h.nodeId,
-            vars: [...h.varsBefore],
-            pendingEntry: ps.pendingEntry || ''
-        };
-        location.hash = `#play/${playStoryId}/${h.chapterId}`;
-    } else {
-        // 同章直接原地跳跃
-        currentVars = [...h.varsBefore];
-        currNodeId = h.nodeId;
-        document.getElementById('textbox-container').style.display = 'none';
-        document.getElementById('choices-container').style.display = 'none';
-        processNode();
-    }
-}
-
 function goNextChapter() {
     const s = getStories().find(x => x.id === playStoryId), ci = (s.chapters || []).findIndex(x => x.id === playChap.id);
     if (ci >= 0 && ci < s.chapters.length - 1) {
         document.getElementById('chapter-end-overlay').classList.remove('active');
+        window._forceEntry = true; // 【核心修复】强制下一章无视历史断点，只认入口伏笔
         location.hash = `#play/${s.id}/${s.chapters[ci+1].id}`;
     }
 }
 
 function goHomeFromEnd() {
     document.getElementById('chapter-end-overlay').classList.remove('active');
-    document.getElementById('bgm-player').pause();
+    stopBgmForce();
     window._isPreview = false;
     location.hash = '#workspace';
 }
 
 function goBackFromEnd() {
     document.getElementById('chapter-end-overlay').classList.remove('active');
-    document.getElementById('bgm-player').pause();
+    stopBgmForce();
     if (window._isPreview) {
         window._isPreview = false;
         location.hash = `#manage/${playStoryId}/node-editor/${playChap.id}`;
@@ -2756,7 +2823,7 @@ function goBackFromEnd() {
 
 function exitPlayer() {
     clearTimeout(autoT); clearTimeout(skipT);
-    document.getElementById('bgm-player').pause();
+    stopBgmForce();
     document.getElementById('textbox-container').onclick = nextLine;
     saveReadProgress();
 
@@ -2770,7 +2837,6 @@ function exitPlayer() {
 }
 
 // ================= 地图编辑器 =================
-let isDrawing = false, brushColor = '#2E8B57';
 function setBrush(c, b) {
     brushColor = c;
     document.querySelectorAll('.brush-btn').forEach(x => x.classList.remove('active'));
@@ -2856,7 +2922,6 @@ function drawCell(c, i) {
     saveStories(getStories());
 }
 
-// ================= 创建新小说 =================
 function openCreateStoryModal() {
     openModal("创建新小说", `<div class="form-group"><label>标题</label><input type="text" id="m-title" value=""></div>`, () => {
         const title = document.getElementById('m-title').value;
@@ -2873,9 +2938,264 @@ function openCreateStoryModal() {
         renderWorkspace();
     });
 }
-function getBranchHistory(storyId) {
-    try { return JSON.parse(localStorage.getItem('vn_branch_history_' + storyId) || '[]'); } catch(e) { return []; }
+// ================= 新建与管理 =================
+function openAddChapterModal() {
+    openModal("新章节", `<input type="text" id="m-ch-title" placeholder="标题">`, () => {
+        const t = document.getElementById('m-ch-title').value;
+        if(!t) return;
+        const s = getStories().find(x => x.id === currentManageId);
+        if(!s.chapters) s.chapters = [];
+        s.chapters.push({ id: 'ch_' + Date.now(), title: t, nodes: [], edges: [] });
+        saveStories(getStories());
+        renderManageSubPage('chapters');
+    });
 }
-function saveBranchHistory(storyId, history) {
-    try { localStorage.setItem('vn_branch_history_' + storyId, JSON.stringify(history)); } catch(e) {}
+
+function openAddCharacterModal() {
+    openModal("新角色", 
+        `<input type="text" id="m-c-name" placeholder="名字">
+         <textarea id="m-c-desc" rows="3" placeholder="简介" style="margin-top:10px;"></textarea>`, 
+        () => {
+            const n = document.getElementById('m-c-name').value;
+            if(!n) return;
+            const s = getStories().find(x => x.id === currentManageId);
+            if(!s.characters) s.characters = [];
+            s.characters.push({ id: 'char_' + Date.now(), name: n, desc: document.getElementById('m-c-desc').value, sprites: [] });
+            saveStories(getStories());
+            renderManageSubPage('characters');
+        }
+    );
+}
+
+function openAddPlotModal() {
+    openModal("新地点", 
+        `<input type="text" id="m-p-title" placeholder="名称">
+         <textarea id="m-p-desc" rows="3" placeholder="描述" style="margin-top:10px;"></textarea>`, 
+        () => {
+            const t = document.getElementById('m-p-title').value;
+            if(!t) return;
+            const s = getStories().find(x => x.id === currentManageId);
+            if(!s.plots) s.plots = [];
+            s.plots.push({ id: 'plot_' + Date.now(), title: t, desc: document.getElementById('m-p-desc').value, x: 50, y: 50 });
+            saveStories(getStories());
+            renderManageSubPage('plots');
+        }
+    );
+}
+
+function openAddWikiModal() {
+    const s = getStories().find(x => x.id === currentManageId);
+    const chapterOpts = (s.chapters || []).map(c=>`<option value="${c.id}">读完 ${escapeHtml(c.title)} 解锁</option>`).join('');
+    openModal("新词条", 
+        `<input type="text" id="m-w-term" placeholder="词条名">
+         <textarea id="m-w-content" rows="3" placeholder="内容" style="margin-top:10px;"></textarea>
+         <select id="m-w-unlock" style="margin-top:10px;width:100%;padding:5px;">
+             <option value="">所有人可见</option>${chapterOpts}
+         </select>`, 
+        () => {
+            const t = document.getElementById('m-w-term').value;
+            if(!t) return;
+            if(!s.wiki) s.wiki = [];
+            s.wiki.push({ 
+                id: 'wiki_' + Date.now(), 
+                term: t, 
+                content: document.getElementById('m-w-content').value, 
+                unlockChapter: document.getElementById('m-w-unlock').value 
+            });
+            saveStories(getStories());
+            renderManageSubPage('wiki');
+        }
+    );
+}
+
+function openAddRelationshipModal() {
+    const s = getStories().find(x=>x.id===currentManageId);
+    if(!s.characters || s.characters.length < 2) return showToast("需要至少2个角色");
+    const opts = s.characters.map(c=>`<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
+    openModal("添加关系", 
+        `<div class="form-group"><label>A</label><select id="m-rel-from">${opts}</select></div>
+         <div class="form-group"><label>B</label><select id="m-rel-to">${opts}</select></div>
+         <div class="form-group"><label>标签</label><input type="text" id="m-rel-label"></div>`, 
+        () => {
+            const f = document.getElementById('m-rel-from').value;
+            const t = document.getElementById('m-rel-to').value;
+            const l = document.getElementById('m-rel-label').value;
+            if(f===t || !l) return;
+            if(!s.relationships) s.relationships = [];
+            s.relationships = s.relationships.filter(r => !(r.from === f && r.to === t) && !(r.from === t && r.to === f));
+            s.relationships.push({ from: f, to: t, label: l });
+            saveStories(getStories());
+            switchCharTab('graph');
+        }
+    );
+}
+
+function saveStoryInfo() {
+    const s = getStories().find(x => x.id === currentManageId);
+    if(!s) return;
+    s.title = document.getElementById('edit-title').value;
+    s.intro = document.getElementById('edit-intro').value;
+    s.tags = document.getElementById('edit-tags').value.split(/[，,]/).map(t=>t.trim()).filter(Boolean);
+    s.cover = document.getElementById('edit-cover').value;
+    saveStories(getStories());
+    showToast("已保存");
+    setTimeout(()=>{ location.hash = `#manage/${s.id}`; }, 500);
+}
+
+function switchCharTab(t) {
+    document.getElementById('tab-char-list').classList.toggle('active', t==='list');
+    document.getElementById('tab-char-graph').classList.toggle('active', t==='graph');
+    document.getElementById('char-content-list').style.display = t==='list'?'flex':'none';
+    document.getElementById('char-content-graph').style.display = t==='graph'?'block':'none';
+    if(t==='graph') renderRelationshipGraph();
+}
+
+function renderRelationshipGraph() {
+    const s = getStories().find(x => x.id === currentManageId);
+    const area = document.getElementById('relationship-graph-area');
+    if (!s || !s.characters || s.characters.length < 2) { area.innerHTML = ''; return; }
+    const chars = s.characters, rels = s.relationships || [];
+    const nodes = chars.map((c, i) => {
+        const a = (i / chars.length) * 2 * Math.PI - Math.PI / 2;
+        return { ...c, x: 400 + 150 * Math.cos(a), y: 250 + 150 * Math.sin(a) };
+    });
+    let svg = `<svg width="100%" height="100%" viewBox="0 0 800 500" preserveAspectRatio="xMidYMid meet">`;
+    rels.forEach(r => {
+        const n1 = nodes.find(n => n.name === r.from), n2 = nodes.find(n => n.name === r.to);
+        if (n1 && n2) {
+            svg += `<line x1="${n1.x}" y1="${n1.y}" x2="${n2.x}" y2="${n2.y}" stroke="#ccc" stroke-width="2" />`;
+            const mx = (n1.x + n2.x) / 2, my = (n1.y + n2.y) / 2;
+            svg += `<rect x="${mx-30}" y="${my-12}" width="60" height="24" fill="#fcf9f2" rx="12" />`;
+            svg += `<text x="${mx}" y="${my+4}" fill="#c0a062" font-size="13" text-anchor="middle" font-weight="bold">${escapeHtml(r.label)}</text>`;
+        }
+    });
+    nodes.forEach(n => {
+        svg += `<g transform="translate(${n.x}, ${n.y})"><circle r="45" fill="#fff" stroke="#c0a062" stroke-width="2"/><text y="5" fill="#333" font-size="15" font-weight="bold" text-anchor="middle">${escapeHtml(n.name)}</text></g>`;
+    });
+    area.innerHTML = svg + `</svg>`;
+}
+
+function exportData() {
+    const dataStr = JSON.stringify(localStoriesCache, null, 2);
+    const blob = new Blob([dataStr], {type: "application/json"});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `backup.json`;
+    a.click();
+}
+
+function importData(e) {
+    const f = e.target.files[0];
+    if(!f) return;
+    const r = new FileReader();
+    r.onload = (ev) => {
+        try {
+            let imp = JSON.parse(ev.target.result);
+            if(!Array.isArray(imp)) imp = imp.stories || [imp];
+            let nc = [...localStoriesCache];
+            imp.forEach(x => {
+                if(x.id && x.title) {
+                    const idx = nc.findIndex(y => y.id === x.id);
+                    if(idx === -1) nc.push(x);
+                    else nc[idx] = x;
+                }
+            });
+            saveStories(nc);
+            renderWorkspace();
+            showToast("导入成功");
+        } catch(err) {
+            showToast("格式错误");
+        }
+    };
+    r.readAsText(f);
+}
+
+// ================= 预览入口（单独处理） =================
+function previewChapter() {
+    if (!currentManageId || !currentChapterId) return;
+    const story = getStories().find(s => s.id === currentManageId);
+    if (!story) return;
+    const chapter = (story.chapters || []).find(c => c.id === currentChapterId);
+    if (!chapter) return;
+
+    const entries = [];
+    (chapter.nodes || []).forEach(n => {
+        if (!n || !n.type) return;
+        if (n.type === 'start') {
+            entries.push({
+                nodeId: n.id,
+                label: n.entryKey ? `🚩 开始 · [${n.entryKey}]` : '🚩 默认入口（无标签开始）'
+            });
+        } else if ((n.type === 'dialogue' || n.type === 'narration') && n.entryKey) {
+            const textPreview = (n.text || '').substring(0, 24);
+            const more = (n.text || '').length > 24 ? '...' : '';
+            entries.push({
+                nodeId: n.id,
+                label: `🚩 [${n.entryKey}] ${n.type === 'dialogue' ? (n.name || '角色') : '旁白'}：${textPreview}${more}`
+            });
+        }
+    });
+
+    if (entries.length === 0) {
+        if (!chapter.nodes || chapter.nodes.length === 0) return showToast("本章还没有节点，无法预览");
+        _startPreviewWith(chapter.nodes[0].id);
+        return;
+    }
+
+    if (entries.length === 1) {
+        _startPreviewWith(entries[0].nodeId);
+        return;
+    }
+
+    let html = `
+        <p style="color:#c0a062; font-size:0.85rem; margin-bottom:15px; line-height:1.6;">
+            💡 本章有 <b>${entries.length}</b> 个可能的入口。请选择从哪个入口开始预览。<br>
+            <span style="color:#888;">本次预览不会影响读者的真实进度和分支走向。</span>
+        </p>
+        <div style="max-height:50vh; overflow-y:auto; display:flex; flex-direction:column; gap:8px;">
+    `;
+    entries.forEach(e => {
+        html += `
+            <button class="glass-btn" style="text-align:left; padding:12px 15px; border-color:#c0a062; color:#fff !important; background:rgba(192,160,98,0.15); white-space:normal; line-height:1.4; word-break:break-word;" onclick="startPreviewFrom('${e.nodeId}')">
+                ${escapeHtml(e.label)}
+            </button>
+        `;
+    });
+    html += `</div>`;
+
+    document.getElementById('modal-title').innerText = '▶ 选择预览入口';
+    document.getElementById('modal-content').innerHTML = html;
+    const btn = document.getElementById('modal-confirm-btn');
+    btn.innerText = '关闭';
+    btn.onclick = () => closeModal();
+    document.getElementById('modal-overlay').classList.add('active');
+}
+
+function _startPreviewWith(nodeId) {
+    window._isPreview = true;
+    window._pendingResume = null;
+    window._previewEntryNodeId = nodeId || null;
+    location.hash = `#play/${currentManageId}/${currentChapterId}`;
+}
+
+function startPreviewFrom(nodeId) {
+    closeModal();
+    _startPreviewWith(nodeId);
+}
+
+function startFresh(storyId) {
+    // 彻底清空所有存档和变量
+    clearResumePoint(storyId);
+    clearPlayState(storyId);
+    window._pendingResume = null;
+    window._forceEntry = false;
+    currentVars = [];
+
+    const story = getStories().find(x => x.id === storyId);
+    if (!story) return;
+    const chapters = story.chapters || [];
+    if (chapters.length === 0) return;
+    
+    // 直接跳到第一章
+    location.hash = `#play/${storyId}/${chapters[0].id}`;
 }
